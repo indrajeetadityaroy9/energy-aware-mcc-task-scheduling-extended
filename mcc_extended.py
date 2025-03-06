@@ -86,7 +86,9 @@ rf_power = {
     'edge1_to_edge2': 0.3,  # P^s_{e1→e2}
     'edge2_to_edge1': 0.3,  # P^s_{e2→e1}
     'edge1_to_cloud': 0.4,  # P^s_{e1→c}
-    'edge2_to_cloud': 0.42  # P^s_{e2→c}
+    'edge2_to_cloud': 0.42,  # P^s_{e2→c}
+    'edge1_to_device': 0.3,  # P^s_{e1→d}
+    'edge2_to_device': 0.35  # P^s_{e2→d}
 }
 
 # Data size configurations for tasks
@@ -108,6 +110,7 @@ task_data_sizes = {
     },
     # Add more entries for all tasks
 }
+
 
 class ExecutionTier(Enum):
     """Defines where a task can be executed in the three-tier architecture"""
@@ -141,10 +144,10 @@ class ExecutionResult:
 @dataclass
 class TaskMigrationState:
     """Tracks task migration decisions"""
-    time: float           # T_total: Completion time after migration
-    energy: float         # E_total: Energy consumption after migration
-    efficiency: float     # Energy reduction per unit time
-    task_index: int       # v_tar: Task selected for migration
+    time: float  # T_total: Completion time after migration
+    energy: float  # E_total: Energy consumption after migration
+    efficiency: float  # Energy reduction per unit time
+    task_index: int  # v_tar: Task selected for migration
     source_tier: ExecutionTier
     target_tier: ExecutionTier
     source_location: Optional[Tuple[int, int]] = None  # (edge_id, core_id) if applicable
@@ -167,11 +170,11 @@ class Task:
         self.cloud_execution_times = cloud_execution_times
 
         # Edge execution times (T_i^e,m) - Section III extension
-        self.edge_execution_times = {}  # (edge_id, core_id) -> execution time
+        self.edge_execution_times = edge_execution_times
 
         # ==== DATA TRANSFER PARAMETERS ====
         # Data sizes for all possible transfers
-        self.data_sizes = {}  # Keys like 'device_to_edge1', 'edge1_to_cloud', etc.
+        self.data_sizes = task_data_sizes.get(id, {})
 
         # ==== ASSIGNMENT AND EXECUTION STATE ====
         # Current execution tier and location
@@ -224,6 +227,8 @@ class Task:
 
     def calculate_local_finish_time(self, core, start_time):
         """Calculate finish time if task runs on a local device core"""
+        if core < 0 or core >= len(self.local_execution_times):
+            raise ValueError(f"Invalid core ID {core} for task {self.id}")
         return start_time + self.local_execution_times[core]
 
     def calculate_cloud_finish_times(self, upload_start_time):
@@ -247,9 +252,11 @@ class Task:
 
     def get_edge_execution_time(self, edge_id, core_id):
         """Get the execution time for a specific edge node and core"""
-        return self.edge_execution_times.get((edge_id, core_id), 5)  # Default if not specified
+        key = (self.id, edge_id, core_id)
+        return self.edge_execution_times.get(key, 5)  # Default to 5 time units if not specified
 
     def calculate_data_transfer_time(self, source_tier, target_tier,
+                                     upload_rates_dict, download_rates_dict,
                                      source_location=None, target_location=None):
         """
         Calculate time to transfer data between locations
@@ -257,6 +264,8 @@ class Task:
         Parameters:
         - source_tier: ExecutionTier of source
         - target_tier: ExecutionTier of target
+        - upload_rates_dict: Dictionary of upload rates between tiers
+        - download_rates_dict: Dictionary of download rates between tiers
         - source_location: For edge tier, tuple of (edge_id, core_id)
         - target_location: For edge tier, tuple of (edge_id, core_id)
 
@@ -276,28 +285,36 @@ class Task:
             edge_id, _ = target_location
             key = f'device_to_edge{edge_id}'
             # T_i^(d→e) = data_i^(d→e) / R^s_(d→e)
-            return self.data_sizes.get(key, 0) / upload_rates.get(key, 1.0)
+            data_size = self.data_sizes.get(key, 0)
+            rate = upload_rates_dict.get(key, 1.0)
+            return 0 if rate == 0 else data_size / rate
 
         # Edge to Device
         elif source_tier == ExecutionTier.EDGE and target_tier == ExecutionTier.DEVICE:
             edge_id, _ = source_location
             key = f'edge{edge_id}_to_device'
             # T_i^(e→d) = data_i^(e→d) / R^r_(e→d)
-            return self.data_sizes.get(key, 0) / download_rates.get(key, 1.0)
+            data_size = self.data_sizes.get(key, 0)
+            rate = download_rates_dict.get(key, 1.0)
+            return 0 if rate == 0 else data_size / rate
 
         # Edge to Cloud
         elif source_tier == ExecutionTier.EDGE and target_tier == ExecutionTier.CLOUD:
             edge_id, _ = source_location
             key = f'edge{edge_id}_to_cloud'
             # T_i^(e→c) = data_i^(e→c) / R^s_(e→c)
-            return self.data_sizes.get(key, 0) / upload_rates.get(key, 1.0)
+            data_size = self.data_sizes.get(key, 0)
+            rate = upload_rates_dict.get(key, 1.0)
+            return 0 if rate == 0 else data_size / rate
 
         # Cloud to Edge
         elif source_tier == ExecutionTier.CLOUD and target_tier == ExecutionTier.EDGE:
             edge_id, _ = target_location
             key = f'cloud_to_edge{edge_id}'
             # T_i^(c→e) = data_i^(c→e) / R^r_(c→e)
-            return self.data_sizes.get(key, 0) / download_rates.get(key, 1.0)
+            data_size = self.data_sizes.get(key, 0)
+            rate = download_rates_dict.get(key, 1.0)
+            return 0 if rate == 0 else data_size / rate
 
         # Edge to Edge migration
         elif source_tier == ExecutionTier.EDGE and target_tier == ExecutionTier.EDGE:
@@ -305,12 +322,14 @@ class Task:
             target_edge_id, _ = target_location
             key = f'edge{source_edge_id}_to_edge{target_edge_id}'
             # T_i^(e→e') = data_i^(e→e') / R^s_(e→e')
-            return self.data_sizes.get(key, 0) / upload_rates.get(key, 1.0)
+            data_size = self.data_sizes.get(key, 0)
+            rate = upload_rates_dict.get(key, 1.0)
+            return 0 if rate == 0 else data_size / rate
 
         # Default case
         return 0
 
-    def calculate_ready_time_edge(self, edge_id):
+    def calculate_ready_time_edge(self, edge_id, upload_rates_dict, download_rates_dict):
         """
         Calculate ready time (RT_i^e,m) for execution on edge node E_m
         Based on the ready time formula from Section III extension:
@@ -332,6 +351,7 @@ class Task:
                 # Time to transfer data from device to this edge
                 transfer_time = pred_task.calculate_data_transfer_time(
                     ExecutionTier.DEVICE, ExecutionTier.EDGE,
+                    upload_rates_dict, download_rates_dict,
                     target_location=(edge_id, 0)  # core_id doesn't matter for transfer
                 )
 
@@ -341,6 +361,7 @@ class Task:
                 # Time to transfer data from cloud to this edge
                 transfer_time = pred_task.calculate_data_transfer_time(
                     ExecutionTier.CLOUD, ExecutionTier.EDGE,
+                    upload_rates_dict, download_rates_dict,
                     target_location=(edge_id, 0)
                 )
 
@@ -356,6 +377,7 @@ class Task:
                     # Different edge node, need edge-to-edge transfer
                     transfer_time = pred_task.calculate_data_transfer_time(
                         ExecutionTier.EDGE, ExecutionTier.EDGE,
+                        upload_rates_dict, download_rates_dict,
                         source_location=(pred_edge_id, 0),
                         target_location=(edge_id, 0)
                     )
@@ -418,3 +440,156 @@ class Task:
             max_ready_time = max(max_ready_time, ready_time)
 
         return max_ready_time
+
+
+# Standalone utility functions for calculating time and energy metrics
+def total_time(tasks):
+    """
+    Extended implementation of total completion time calculation for three-tier model
+    Extends equation (10) to include edge execution finish times
+
+    Parameters:
+    - tasks: List of Task objects
+
+    Returns:
+    - Total completion time (maximum finish time across all exit tasks)
+    """
+    if not tasks:
+        return 0
+
+    exit_tasks = [task for task in tasks if not task.succ_tasks]
+    if not exit_tasks:
+        # If no explicit exit tasks, use all tasks
+        exit_tasks = tasks
+
+    max_completion_time = 0
+    for task in exit_tasks:
+        # Calculate maximum finish time for this task across all execution units
+        task_finish_times = [
+            task.FT_l,  # Device local execution finish time
+            task.FT_wr  # Cloud execution (results received) finish time
+        ]
+
+        # Add edge execution finish times if available
+        if task.FT_edge_receive and len(task.FT_edge_receive) > 0:
+            task_finish_times.append(max(task.FT_edge_receive.values()))
+
+        max_completion_time = max(max_completion_time, max(task_finish_times))
+
+    return max_completion_time
+
+
+def calculate_energy_consumption(task, core_powers, rf_power, upload_rates, download_rates):
+    """
+    Calculate energy consumption for a single task in the three-tier model
+    Extended from equations (7) and (8) to include edge execution and transfers
+
+    Parameters:
+    - task: The Task object
+    - core_powers: Dictionary mapping core IDs to their power consumption
+    - rf_power: Dictionary of RF power consumption rates for different transfers
+    - upload_rates: Dictionary of upload rates between tiers
+    - download_rates: Dictionary of download rates between tiers
+
+    Returns:
+    - Energy consumption for this task
+    """
+    # Device-tier execution (original equation 7)
+    if task.execution_tier == ExecutionTier.DEVICE:
+        if task.device_core < 0 or task.device_core >= len(task.local_execution_times):
+            return 0  # Invalid core assignment
+        # E_i^l = P_k × T_i^l,k
+        return core_powers[task.device_core] * task.local_execution_times[task.device_core]
+
+    # Calculate energy based on the execution path
+    total_energy = 0
+
+    # Empty execution path check
+    if not task.execution_path or len(task.execution_path) < 2:
+        # If no execution path is tracked, use current assignment
+        if task.execution_tier == ExecutionTier.CLOUD:
+            # E_i^c = P^s × T_i^s (device to cloud, original equation 8)
+            return rf_power['device_to_cloud'] * task.cloud_execution_times[0]
+        elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+            # Device to edge transfer
+            edge_id = task.edge_assignment.edge_id
+            key = f'device_to_edge{edge_id}'
+            # E = P^s × (data_i^(d→e) / R^s_(d→e))
+            data_size = task.data_sizes.get(key, 0)
+            rate = upload_rates.get(key, 1.0)
+            transfer_time = 0 if rate == 0 else data_size / rate
+            return rf_power[key] * transfer_time
+        return 0
+
+    # Track energy consumption through the execution path
+    for i, (tier, location) in enumerate(task.execution_path[:-1]):
+        next_tier, next_location = task.execution_path[i + 1]
+
+        # Device to Edge transfer
+        if tier == ExecutionTier.DEVICE and next_tier == ExecutionTier.EDGE:
+            edge_id, _ = next_location
+            key = f'device_to_edge{edge_id}'
+            # E = P^s × (data_i^(d→e) / R^s_(d→e))
+            data_size = task.data_sizes.get(key, 0)
+            rate = upload_rates.get(key, 1.0)
+            transfer_time = 0 if rate == 0 else data_size / rate
+            total_energy += rf_power[key] * transfer_time
+
+        # Device to Cloud transfer (original equation 8)
+        elif tier == ExecutionTier.DEVICE and next_tier == ExecutionTier.CLOUD:
+            # E_i^c = P^s × T_i^s
+            total_energy += rf_power['device_to_cloud'] * task.cloud_execution_times[0]
+
+        # Edge to Edge migration
+        elif tier == ExecutionTier.EDGE and next_tier == ExecutionTier.EDGE:
+            source_edge_id, _ = location
+            target_edge_id, _ = next_location
+            key = f'edge{source_edge_id}_to_edge{target_edge_id}'
+            # E = P^s × (data_i^(e→e') / R^s_(e→e'))
+            data_size = task.data_sizes.get(key, 0)
+            rate = upload_rates.get(key, 1.0)
+            transfer_time = 0 if rate == 0 else data_size / rate
+            total_energy += rf_power[key] * transfer_time
+
+        # Edge to Cloud transfer
+        elif tier == ExecutionTier.EDGE and next_tier == ExecutionTier.CLOUD:
+            edge_id, _ = location
+            key = f'edge{edge_id}_to_cloud'
+            # E = P^s × (data_i^(e→c) / R^s_(e→c))
+            data_size = task.data_sizes.get(key, 0)
+            rate = upload_rates.get(key, 1.0)
+            transfer_time = 0 if rate == 0 else data_size / rate
+            total_energy += rf_power[key] * transfer_time
+
+        # Edge to Device return transfer (add this for completeness)
+        elif tier == ExecutionTier.EDGE and next_tier == ExecutionTier.DEVICE:
+            edge_id, _ = location
+            key = f'edge{edge_id}_to_device'
+            # E = P^s × (data_i^(e→d) / R^r_(e→d))
+            data_size = task.data_sizes.get(key, 0)
+            rate = download_rates.get(key, 1.0)
+            transfer_time = 0 if rate == 0 else data_size / rate
+            total_energy += rf_power[key] * transfer_time
+
+    return total_energy
+
+
+def total_energy(tasks, core_powers, rf_power, upload_rates, download_rates):
+    """
+    Calculate total energy consumption across all tasks in the three-tier model
+    Extends equation (9) to account for all possible execution paths
+
+    Parameters:
+    - tasks: List of Task objects
+    - core_powers: Dictionary mapping core IDs to their power consumption
+    - rf_power: Dictionary of RF power consumption rates for different transfers
+    - upload_rates: Dictionary of upload rates between tiers
+    - download_rates: Dictionary of download rates between tiers
+
+    Returns:
+    - Total energy consumption across all tasks
+    """
+    return sum(
+        calculate_energy_consumption(task, core_powers, rf_power, upload_rates, download_rates)
+        for task in tasks
+    )
