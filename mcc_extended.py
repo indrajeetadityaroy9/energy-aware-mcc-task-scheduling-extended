@@ -779,3 +779,847 @@ def task_prioritizing(tasks):
     # Update priority scores in task objects
     for task in tasks:
         task.priority_score = computed_priority_scores[task.id]
+
+
+class ThreeTierTaskScheduler:
+    """
+    Comprehensive implementation of the initial scheduling algorithm for three-tier architecture.
+    Extends the original InitialTaskScheduler to include edge nodes as an intermediate tier.
+    """
+
+    def __init__(self, tasks, num_local_cores=3, num_edge_nodes=2, cores_per_edge=2):
+        """
+        Initialize the scheduler with tasks and resources across three tiers.
+
+        Args:
+            tasks: List of Task objects representing the application DAG
+            num_local_cores: Number of cores on the mobile device (K)
+            num_edge_nodes: Number of edge computing nodes (M)
+            cores_per_edge: Number of cores per edge node
+        """
+        self.tasks = tasks
+        self.k = num_local_cores  # K cores on mobile device
+        self.m = num_edge_nodes  # M edge nodes
+        self.cores_per_edge = cores_per_edge  # Cores per edge node
+
+        # === DEVICE RESOURCE TRACKING ===
+        # Local core availability
+        self.core_earliest_ready = [0] * self.k  # When each local core becomes available
+
+        # === CLOUD RESOURCE TRACKING ===
+        # Wireless channel availability for device-cloud communication
+        self.ws_ready = 0  # Next available time for RF sending channel (device to cloud)
+        self.wr_ready = 0  # Next available time for RF receiving channel (cloud to device)
+
+        # === EDGE RESOURCE TRACKING ===
+        # Edge node core availability
+        self.edge_core_earliest_ready = {
+            (edge_id, core_id): 0
+            for edge_id in range(1, self.m + 1)
+            for core_id in range(1, self.cores_per_edge + 1)
+        }
+
+        # === COMMUNICATION CHANNEL TRACKING ===
+        # Device-Edge communication channels
+        self.device_to_edge_ready = {edge_id: 0 for edge_id in range(1, self.m + 1)}
+        self.edge_to_device_ready = {edge_id: 0 for edge_id in range(1, self.m + 1)}
+
+        # Edge-Cloud communication channels
+        self.edge_to_cloud_ready = {edge_id: 0 for edge_id in range(1, self.m + 1)}
+        self.cloud_to_edge_ready = {edge_id: 0 for edge_id in range(1, self.m + 1)}
+
+        # Edge-Edge communication channels
+        self.edge_to_edge_ready = {
+            (src, dst): 0
+            for src in range(1, self.m + 1)
+            for dst in range(1, self.m + 1) if src != dst
+        }
+
+        # === TASK SEQUENCES ===
+        # Sequences of tasks scheduled on each execution unit
+        self.sequences = {}
+
+        # Local cores
+        for i in range(self.k):
+            self.sequences[f'device_core_{i}'] = []
+
+        # Edge nodes and cores
+        for edge_id in range(1, self.m + 1):
+            for core_id in range(1, self.cores_per_edge + 1):
+                self.sequences[f'edge_{edge_id}_core_{core_id}'] = []
+
+        # Cloud
+        self.sequences['cloud'] = []
+
+        # Initialize task execution time information
+        self._initialize_task_data()
+
+    def _initialize_task_data(self):
+        """Initialize task execution time data structures if needed."""
+        for task in self.tasks:
+            # Initialize finish time tracking for edge nodes if not already present
+            if not hasattr(task, 'FT_edge') or task.FT_edge is None:
+                task.FT_edge = {}
+
+            # Initialize edge sending finish times if not already present
+            if not hasattr(task, 'FT_edge_send') or task.FT_edge_send is None:
+                task.FT_edge_send = {}
+
+            # Initialize edge receiving finish times if not already present
+            if not hasattr(task, 'FT_edge_receive') or task.FT_edge_receive is None:
+                task.FT_edge_receive = {}
+
+            # Initialize ready times for edge nodes if not already present
+            if not hasattr(task, 'RT_edge') or task.RT_edge is None:
+                task.RT_edge = {}
+
+    def get_priority_ordered_tasks(self):
+        """
+        Orders tasks by priority scores calculated in the task_prioritizing phase.
+        Returns a list of task IDs in descending order of priority.
+        """
+        # Sort tasks by their priority scores (higher first)
+        task_priority_list = [(task.priority_score, task.id) for task in self.tasks]
+        task_priority_list.sort(reverse=True)
+
+        return [item[1] for item in task_priority_list]
+
+    def classify_entry_tasks(self, priority_order):
+        """
+        Separates tasks into entry and non-entry tasks while maintaining priority order.
+        Entry tasks have no predecessors and can start immediately.
+
+        Args:
+            priority_order: List of task IDs in priority order
+
+        Returns:
+            Tuple of (entry_tasks, non_entry_tasks)
+        """
+        entry_tasks = []
+        non_entry_tasks = []
+
+        for task_id in priority_order:
+            # Find the task object from its ID
+            task = next((t for t in self.tasks if t.id == task_id), None)
+            if task:
+                if not task.pred_tasks:
+                    # Entry tasks have no predecessors
+                    entry_tasks.append(task)
+                else:
+                    # Non-entry tasks have at least one predecessor
+                    non_entry_tasks.append(task)
+
+        return entry_tasks, non_entry_tasks
+
+    def calculate_ready_time_local(self, task):
+        """
+        Calculates ready time for local execution on device cores.
+        Implements the extended ready time formula for the three-tier architecture.
+
+        Args:
+            task: The task for which to calculate ready time
+
+        Returns:
+            The ready time for local execution
+        """
+        if not task.pred_tasks:
+            return 0  # Entry task, ready at time 0
+
+        max_ready_time = 0
+
+        for pred_task in task.pred_tasks:
+            # Case 1: Predecessor executed locally on device
+            local_finish = pred_task.FT_l if hasattr(pred_task, 'FT_l') and pred_task.FT_l > 0 else 0
+
+            # Case 2: Predecessor executed in cloud
+            cloud_receive = pred_task.FT_wr if hasattr(pred_task, 'FT_wr') and pred_task.FT_wr > 0 else 0
+
+            # Case 3: Predecessor executed on edge node(s)
+            edge_receive = 0
+
+            if (hasattr(pred_task, 'execution_tier') and
+                    pred_task.execution_tier == ExecutionTier.EDGE and
+                    hasattr(pred_task, 'edge_assignment') and
+                    pred_task.edge_assignment):
+
+                edge_id = pred_task.edge_assignment.edge_id
+
+                # Get when task finished on the edge node
+                edge_finish = pred_task.FT_edge.get(edge_id, 0) if hasattr(pred_task, 'FT_edge') else 0
+
+                # Check if results were transferred back to device
+                if hasattr(pred_task, 'FT_edge_receive') and edge_id in pred_task.FT_edge_receive:
+                    edge_receive = pred_task.FT_edge_receive[edge_id]
+                else:
+                    # Calculate edge-to-device transfer time
+                    e2d_key = f'edge{edge_id}_to_device'
+                    data_size = pred_task.data_sizes.get(e2d_key, 0) if hasattr(pred_task, 'data_sizes') else 0
+                    rate = download_rates.get(e2d_key, 1.0)
+
+                    # Δ_j,m->d = data_j^(m->d) / R_m->d^s
+                    transfer_time = 0 if rate == 0 else data_size / rate
+
+                    # FT_j^wr,(m->d) = FT_j^e,m + Δ_j,m->d
+                    edge_receive = edge_finish + transfer_time
+
+            # Take maximum of all possible finish times for this predecessor
+            pred_finish = max(local_finish, cloud_receive, edge_receive)
+
+            # Update max ready time across all predecessors
+            max_ready_time = max(max_ready_time, pred_finish)
+
+        return max_ready_time
+
+    def calculate_ready_time_cloud(self, task):
+        """
+        Calculates ready time for cloud offloading.
+        Implements the wireless sending ready time (RT_i^ws) calculation.
+
+        Args:
+            task: The task for which to calculate ready time
+
+        Returns:
+            The ready time for wireless sending
+        """
+        if not task.pred_tasks:
+            return self.ws_ready  # Entry task, ready when channel is available
+
+        max_ready_time = 0
+
+        for pred_task in task.pred_tasks:
+            if hasattr(pred_task, 'execution_tier'):
+                if pred_task.execution_tier == ExecutionTier.DEVICE:
+                    # Predecessor on device: wait for local finish
+                    max_ready_time = max(max_ready_time, pred_task.FT_l if hasattr(pred_task, 'FT_l') else 0)
+
+                elif pred_task.execution_tier == ExecutionTier.CLOUD:
+                    # Predecessor on cloud: wait for sending completion
+                    max_ready_time = max(max_ready_time, pred_task.FT_ws if hasattr(pred_task, 'FT_ws') else 0)
+
+                elif pred_task.execution_tier == ExecutionTier.EDGE:
+                    # Predecessor on edge: depends on whether we need data transfer
+                    if hasattr(pred_task, 'edge_assignment') and pred_task.edge_assignment:
+                        edge_id = pred_task.edge_assignment.edge_id
+
+                        # Need to get data from edge first
+                        if hasattr(pred_task, 'FT_edge_receive') and edge_id in pred_task.FT_edge_receive:
+                            max_ready_time = max(max_ready_time, pred_task.FT_edge_receive[edge_id])
+                        else:
+                            # Calculate time when data would arrive from edge
+                            edge_finish = pred_task.FT_edge.get(edge_id, 0) if hasattr(pred_task, 'FT_edge') else 0
+                            e2d_key = f'edge{edge_id}_to_device'
+                            data_size = pred_task.data_sizes.get(e2d_key, 0) if hasattr(pred_task, 'data_sizes') else 0
+                            rate = download_rates.get(e2d_key, 1.0)
+                            transfer_time = 0 if rate == 0 else data_size / rate
+                            max_ready_time = max(max_ready_time, edge_finish + transfer_time)
+
+        # Also consider wireless channel availability
+        return max(max_ready_time, self.ws_ready)
+
+    def calculate_ready_time_edge(self, task, edge_id):
+        """
+        Calculates ready time for execution on a specific edge node.
+
+        Args:
+            task: The task for which to calculate ready time
+            edge_id: The edge node ID
+
+        Returns:
+            The ready time for edge execution
+        """
+        if not task.pred_tasks:
+            return self.device_to_edge_ready[edge_id]  # Entry task, ready when channel is available
+
+        max_ready_time = 0
+
+        for pred_task in task.pred_tasks:
+            if hasattr(pred_task, 'execution_tier'):
+                if pred_task.execution_tier == ExecutionTier.DEVICE:
+                    # Predecessor on device: wait for local finish
+                    max_ready_time = max(max_ready_time, pred_task.FT_l if hasattr(pred_task, 'FT_l') else 0)
+
+                elif pred_task.execution_tier == ExecutionTier.CLOUD:
+                    # Predecessor on cloud: wait for results to return
+                    max_ready_time = max(max_ready_time, pred_task.FT_wr if hasattr(pred_task, 'FT_wr') else 0)
+
+                elif pred_task.execution_tier == ExecutionTier.EDGE:
+                    # Predecessor on edge: depends on whether it's the same edge
+                    if hasattr(pred_task, 'edge_assignment') and pred_task.edge_assignment:
+                        pred_edge_id = pred_task.edge_assignment.edge_id
+
+                        if pred_edge_id == edge_id:
+                            # Same edge node: just wait for execution to finish
+                            edge_finish = pred_task.FT_edge.get(edge_id, 0) if hasattr(pred_task, 'FT_edge') else 0
+                            max_ready_time = max(max_ready_time, edge_finish)
+                        else:
+                            # Different edge node: need edge-to-edge transfer
+                            # This is complex - for simplicity, we'll assume data comes back to device first
+                            if hasattr(pred_task, 'FT_edge_receive') and pred_edge_id in pred_task.FT_edge_receive:
+                                max_ready_time = max(max_ready_time, pred_task.FT_edge_receive[pred_edge_id])
+                            else:
+                                # Calculate time when data would arrive from edge to device
+                                edge_finish = pred_task.FT_edge.get(pred_edge_id, 0) if hasattr(pred_task,
+                                                                                                'FT_edge') else 0
+                                e2d_key = f'edge{pred_edge_id}_to_device'
+                                data_size = pred_task.data_sizes.get(e2d_key, 0) if hasattr(pred_task,
+                                                                                            'data_sizes') else 0
+                                rate = download_rates.get(e2d_key, 1.0)
+                                transfer_time = 0 if rate == 0 else data_size / rate
+                                max_ready_time = max(max_ready_time, edge_finish + transfer_time)
+
+        # Consider device-to-edge channel availability
+        return max(max_ready_time, self.device_to_edge_ready[edge_id])
+
+    def identify_optimal_local_core(self, task, ready_time=0):
+        """
+        Finds optimal local core assignment for a task to minimize finish time.
+
+        Args:
+            task: The task to schedule
+            ready_time: Ready time for local execution
+
+        Returns:
+            Tuple of (core_id, start_time, finish_time)
+        """
+        best_finish_time = float('inf')
+        best_core = -1
+        best_start_time = float('inf')
+
+        for core in range(self.k):
+            # Calculate earliest possible start time on this core
+            start_time = max(ready_time, self.core_earliest_ready[core])
+
+            # Calculate finish time using local execution time for this core
+            finish_time = start_time + task.local_execution_times[core]
+
+            # Choose core that gives earliest finish time
+            if finish_time < best_finish_time:
+                best_finish_time = finish_time
+                best_core = core
+                best_start_time = start_time
+
+        return best_core, best_start_time, best_finish_time
+
+    def identify_optimal_edge_node(self, task, ready_time=0):
+        """
+        Finds optimal edge node and core assignment to minimize finish time.
+
+        Args:
+            task: The task to schedule
+            ready_time: Base ready time (e.g., from predecessors)
+
+        Returns:
+            Tuple with edge assignment details and timing information
+        """
+        best_finish_time = float('inf')
+        best_edge_id = -1
+        best_core_id = -1
+        best_start_time = float('inf')
+        best_upload_start = 0
+        best_upload_finish = 0
+        best_download_start = 0
+        best_download_finish = 0
+
+        # Try each edge node
+        for edge_id in range(1, self.m + 1):
+            # Calculate data transfer times to this edge
+            d2e_key = f'device_to_edge{edge_id}'
+            e2d_key = f'edge{edge_id}_to_device'
+
+            # Data sizes for transfers
+            d2e_data_size = task.data_sizes.get(d2e_key, 0) if hasattr(task, 'data_sizes') else 0
+            e2d_data_size = task.data_sizes.get(e2d_key, 0) if hasattr(task, 'data_sizes') else 0
+
+            # Transfer rates
+            d2e_rate = upload_rates.get(d2e_key, 1.0)
+            e2d_rate = download_rates.get(e2d_key, 1.0)
+
+            # Calculate transfer times
+            d2e_time = 0 if d2e_rate == 0 else d2e_data_size / d2e_rate
+            e2d_time = 0 if e2d_rate == 0 else e2d_data_size / e2d_rate
+
+            # Upload start time depends on task ready time and channel availability
+            edge_ready_time = self.calculate_ready_time_edge(task, edge_id)
+            upload_start = max(ready_time, edge_ready_time, self.device_to_edge_ready[edge_id])
+            upload_finish = upload_start + d2e_time
+
+            # Try each core on this edge node
+            for core_id in range(1, self.cores_per_edge + 1):
+                # Execution can start after upload completes and core is available
+                core_key = (edge_id, core_id)
+                exec_start = max(upload_finish, self.edge_core_earliest_ready[core_key])
+
+                # Get execution time for this edge node and core
+                exec_time = task.get_edge_execution_time(edge_id, core_id) if hasattr(task,
+                                                                                      'get_edge_execution_time') else 5
+                exec_finish = exec_start + exec_time
+
+                # Download can start after execution completes and channel is available
+                download_start = max(exec_finish, self.edge_to_device_ready[edge_id])
+                download_finish = download_start + e2d_time
+
+                # Consider the total finish time (when results are available on device)
+                if download_finish < best_finish_time:
+                    best_finish_time = download_finish
+                    best_edge_id = edge_id
+                    best_core_id = core_id
+                    best_start_time = exec_start
+                    best_finish_exec = exec_finish
+                    best_upload_start = upload_start
+                    best_upload_finish = upload_finish
+                    best_download_start = download_start
+                    best_download_finish = download_finish
+
+        return (best_edge_id, best_core_id, best_start_time, best_finish_exec,
+                best_upload_start, best_upload_finish, best_download_start, best_download_finish)
+
+    def calculate_cloud_phases_timing(self, task):
+        """
+        Calculates timing for the three-phase cloud execution model.
+
+        Args:
+            task: The task to schedule
+
+        Returns:
+            Tuple of timing details for cloud execution phases
+        """
+        # Phase 1: RF Sending Phase
+        send_ready = task.RT_ws if hasattr(task, 'RT_ws') else self.calculate_ready_time_cloud(task)
+        send_time = task.cloud_execution_times[0] if hasattr(task, 'cloud_execution_times') else 3
+        send_finish = max(send_ready, self.ws_ready) + send_time
+
+        # Phase 2: Cloud Computing Phase
+        # Ready time depends on completion of sending and cloud predecessors
+        cloud_ready = send_finish
+
+        for pred_task in task.pred_tasks:
+            if hasattr(pred_task, 'execution_tier') and pred_task.execution_tier == ExecutionTier.CLOUD:
+                cloud_ready = max(cloud_ready, pred_task.FT_c if hasattr(pred_task, 'FT_c') else 0)
+
+            # Add edge-to-cloud predecessor consideration
+            elif (hasattr(pred_task, 'execution_tier') and
+                  pred_task.execution_tier == ExecutionTier.EDGE and
+                  hasattr(pred_task, 'edge_assignment') and
+                  pred_task.edge_assignment):
+
+                edge_id = pred_task.edge_assignment.edge_id
+                # If this edge sent data to cloud for this predecessor
+                edge_to_cloud_key = (edge_id, 'cloud')
+                if hasattr(pred_task, 'FT_edge_send') and edge_to_cloud_key in pred_task.FT_edge_send:
+                    cloud_ready = max(cloud_ready, pred_task.FT_edge_send[edge_to_cloud_key])
+
+        # Cloud execution time
+        cloud_time = task.cloud_execution_times[1] if hasattr(task, 'cloud_execution_times') else 1
+        cloud_finish = cloud_ready + cloud_time
+
+        # Phase 3: RF Receiving Phase
+        receive_ready = cloud_finish
+        receive_time = task.cloud_execution_times[2] if hasattr(task, 'cloud_execution_times') else 1
+        receive_finish = max(receive_ready, self.wr_ready) + receive_time
+
+        return send_ready, send_finish, cloud_ready, cloud_finish, receive_ready, receive_finish
+
+    def schedule_on_local_core(self, task, core, start_time, finish_time):
+        """
+        Schedules a task on a local core.
+
+        Args:
+            task: The task to schedule
+            core: The core ID
+            start_time: When the task will start
+            finish_time: When the task will finish
+        """
+        # Set task execution details
+        task.execution_tier = ExecutionTier.DEVICE
+        task.device_core = core
+        task.RT_l = start_time - task.local_execution_times[core]  # Back-calculate ready time
+        task.FT_l = finish_time
+
+        # Clear cloud and edge execution information
+        task.FT_ws = 0
+        task.FT_c = 0
+        task.FT_wr = 0
+        task.edge_assignment = None
+
+        # Set overall execution finish time
+        task.execution_finish_time = finish_time
+
+        # Update core availability
+        self.core_earliest_ready[core] = finish_time
+
+        # Mark task as scheduled
+        task.is_scheduled = SchedulingState.SCHEDULED
+
+        # Add to appropriate sequence
+        self.sequences[f'device_core_{core}'].append(task.id)
+
+    def schedule_on_edge(self, task, edge_id, core_id, start_time, finish_time,
+                         upload_start, upload_finish, download_start, download_finish):
+        """
+        Schedules a task on an edge node.
+
+        Args:
+            task: The task to schedule
+            edge_id: The edge node ID
+            core_id: The core ID on the edge node
+            start_time: When execution will start on the edge
+            finish_time: When execution will finish on the edge
+            upload_start: When data upload to edge starts
+            upload_finish: When data upload to edge finishes
+            download_start: When result download from edge starts
+            download_finish: When result download from edge finishes
+        """
+        # Set task execution tier and assignment
+        task.execution_tier = ExecutionTier.EDGE
+        task.edge_assignment = EdgeAssignment(edge_id=edge_id, core_id=core_id)
+
+        # Clear local and cloud finish times
+        task.FT_l = 0
+        task.FT_ws = 0
+        task.FT_c = 0
+        task.FT_wr = 0
+
+        # Set edge execution timing
+        task.RT_edge[edge_id] = upload_finish  # Ready after upload completes
+        task.FT_edge[edge_id] = finish_time
+
+        # Set edge transfer timing
+        d2e_key = (0, edge_id)  # 0 represents device
+        task.FT_edge_send[d2e_key] = upload_finish
+
+        e2d_key = edge_id
+        task.FT_edge_receive[e2d_key] = download_finish
+
+        # Set overall execution finish time (when results are available on device)
+        task.execution_finish_time = download_finish
+
+        # Update resource availability
+        self.edge_core_earliest_ready[(edge_id, core_id)] = finish_time
+        self.device_to_edge_ready[edge_id] = upload_finish
+        self.edge_to_device_ready[edge_id] = download_finish
+
+        # Mark task as scheduled
+        task.is_scheduled = SchedulingState.SCHEDULED
+
+        # Add to appropriate sequence
+        self.sequences[f'edge_{edge_id}_core_{core_id}'].append(task.id)
+
+    def schedule_on_cloud(self, task, send_ready, send_finish, cloud_ready, cloud_finish, receive_ready,
+                          receive_finish):
+        """
+        Schedules a task on the cloud.
+
+        Args:
+            task: The task to schedule
+            send_ready: When data upload to cloud can start
+            send_finish: When data upload to cloud completes
+            cloud_ready: When cloud execution can start
+            cloud_finish: When cloud execution completes
+            receive_ready: When result download from cloud can start
+            receive_finish: When result download from cloud completes
+        """
+        # Set task execution tier
+        task.execution_tier = ExecutionTier.CLOUD
+
+        # Clear local and edge finish times
+        task.FT_l = 0
+        task.edge_assignment = None
+
+        # Set cloud execution timing
+        task.RT_ws = send_ready
+        task.FT_ws = send_finish
+        task.RT_c = cloud_ready
+        task.FT_c = cloud_finish
+        task.RT_wr = receive_ready
+        task.FT_wr = receive_finish
+
+        # Set overall execution finish time
+        task.execution_finish_time = receive_finish
+
+        # Update wireless channel availability
+        self.ws_ready = send_finish
+        self.wr_ready = receive_finish
+
+        # Mark task as scheduled
+        task.is_scheduled = SchedulingState.SCHEDULED
+
+        # Add to cloud sequence
+        self.sequences['cloud'].append(task.id)
+
+    def schedule_entry_tasks(self, entry_tasks):
+        """
+        Schedules tasks with no predecessors.
+        Process in order: local tasks first, then edge tasks, then cloud tasks.
+
+        Args:
+            entry_tasks: List of tasks with no predecessors
+        """
+        # Categorize entry tasks by their execution tier
+        local_tasks = []
+        edge_tasks = []
+        cloud_tasks = []
+
+        for task in entry_tasks:
+            if hasattr(task, 'execution_tier'):
+                if task.execution_tier == ExecutionTier.DEVICE:
+                    local_tasks.append(task)
+                elif task.execution_tier == ExecutionTier.EDGE:
+                    edge_tasks.append(task)
+                elif task.execution_tier == ExecutionTier.CLOUD:
+                    cloud_tasks.append(task)
+            else:
+                # Default to local if not specified
+                local_tasks.append(task)
+
+        # Schedule local tasks first (lowest communication overhead)
+        for task in local_tasks:
+            core, start_time, finish_time = self.identify_optimal_local_core(task)
+            self.schedule_on_local_core(task, core, start_time, finish_time)
+
+        # Schedule edge tasks next
+        for task in edge_tasks:
+            # Find best edge node and timing
+            (edge_id, core_id, start_time, finish_time,
+             upload_start, upload_finish, download_start, download_finish) = self.identify_optimal_edge_node(task)
+
+            if edge_id != -1:
+                # Schedule on edge
+                self.schedule_on_edge(task, edge_id, core_id, start_time, finish_time,
+                                      upload_start, upload_finish, download_start, download_finish)
+            else:
+                # Fallback to local if no valid edge found
+                core, start_time, finish_time = self.identify_optimal_local_core(task)
+                self.schedule_on_local_core(task, core, start_time, finish_time)
+
+        # Schedule cloud tasks last (highest communication overhead)
+        for task in cloud_tasks:
+            # Calculate ready time for cloud upload
+            task.RT_ws = self.calculate_ready_time_cloud(task)
+
+            # Calculate cloud execution timing
+            timing = self.calculate_cloud_phases_timing(task)
+
+            # Schedule on cloud
+            self.schedule_on_cloud(task, *timing)
+
+    def schedule_non_entry_tasks(self, non_entry_tasks):
+        """
+        Schedules tasks that have predecessors.
+        For each task, evaluate options across all tiers and choose the one that minimizes finish time.
+
+        Args:
+            non_entry_tasks: List of tasks with predecessors
+        """
+        for task in non_entry_tasks:
+            # Calculate ready times for all execution units
+            local_ready_time = self.calculate_ready_time_local(task)
+            cloud_ready_time = self.calculate_ready_time_cloud(task)
+
+            # Find best local core option
+            local_core, local_start, local_finish = self.identify_optimal_local_core(task, local_ready_time)
+
+            # Find best edge node option
+            (edge_id, core_id, edge_start, edge_finish,
+             upload_start, upload_finish, download_start, download_finish) = self.identify_optimal_edge_node(task,
+                                                                                                             local_ready_time)
+
+            # Set task's cloud ready time for cloud scheduling
+            task.RT_ws = cloud_ready_time
+
+            # Calculate cloud option
+            cloud_timing = self.calculate_cloud_phases_timing(task)
+            cloud_finish = cloud_timing[5]  # The receive_finish time
+
+            # Choose execution path with earliest finish time
+            if local_finish <= download_finish and local_finish <= cloud_finish:
+                # Local execution is fastest
+                self.schedule_on_local_core(task, local_core, local_start, local_finish)
+
+            elif download_finish <= local_finish and download_finish <= cloud_finish:
+                # Edge execution is fastest
+                self.schedule_on_edge(task, edge_id, core_id, edge_start, edge_finish,
+                                      upload_start, upload_finish, download_start, download_finish)
+
+            else:
+                # Cloud execution is fastest
+                self.schedule_on_cloud(task, *cloud_timing)
+
+    def calculate_execution_unit_load(self):
+        """
+        Calculates the load (utilization) of each execution unit.
+
+        Returns:
+            Dictionary mapping execution unit names to their utilization percentage
+        """
+        # Track total execution time and span for each unit
+        unit_exec_time = {}
+        unit_span = {}
+
+        # Initialize with zero execution time
+        for unit in self.sequences.keys():
+            unit_exec_time[unit] = 0
+            unit_span[unit] = 0
+
+        # Calculate execution time for each unit
+        for unit, task_ids in self.sequences.items():
+            if not task_ids:
+                continue
+
+            # Find tasks from IDs
+            unit_tasks = [next((t for t in self.tasks if t.id == task_id), None) for task_id in task_ids]
+            unit_tasks = [t for t in unit_tasks if t is not None]
+
+            if not unit_tasks:
+                continue
+
+            # Calculate total execution time
+            if 'device_core' in unit:
+                core = int(unit.split('_')[-1])
+                unit_exec_time[unit] = sum(task.local_execution_times[core] for task in unit_tasks)
+
+                # Find span (difference between first start and last finish)
+                first_start = min(self.core_earliest_ready[core] - task.local_execution_times[core]
+                                  for task in unit_tasks)
+                last_finish = max(task.FT_l for task in unit_tasks)
+                unit_span[unit] = last_finish - first_start
+
+            elif 'edge' in unit:
+                # Extract edge and core IDs
+                parts = unit.split('_')
+                edge_id = int(parts[1])
+                core_id = int(parts[3])
+
+                # Sum execution times
+                unit_exec_time[unit] = sum(task.get_edge_execution_time(edge_id, core_id)
+                                           if hasattr(task, 'get_edge_execution_time') else 5
+                                           for task in unit_tasks)
+
+                # Find span
+                try:
+                    first_start = min(task.RT_edge.get(edge_id, 0) for task in unit_tasks)
+                    last_finish = max(task.FT_edge.get(edge_id, 0) for task in unit_tasks)
+                    unit_span[unit] = last_finish - first_start
+                except:
+                    unit_span[unit] = 0
+
+            elif unit == 'cloud':
+                # For cloud, use cloud execution time
+                unit_exec_time[unit] = sum(task.cloud_execution_times[1]
+                                           if hasattr(task, 'cloud_execution_times') else 1
+                                           for task in unit_tasks)
+
+                # Find span
+                first_start = min(task.RT_c for task in unit_tasks if hasattr(task, 'RT_c') and task.RT_c > 0)
+                last_finish = max(task.FT_c for task in unit_tasks if hasattr(task, 'FT_c') and task.FT_c > 0)
+                unit_span[unit] = last_finish - first_start
+
+        # Calculate utilization
+        unit_utilization = {}
+        for unit in self.sequences.keys():
+            if unit_span[unit] > 0:
+                unit_utilization[unit] = unit_exec_time[unit] / unit_span[unit] * 100
+            else:
+                unit_utilization[unit] = 0
+
+        return unit_utilization
+
+    def execute(self):
+        """
+        Executes the full initial scheduling algorithm.
+
+        Returns:
+            Dictionary of task sequences for each execution unit
+        """
+        # Get tasks in priority order
+        priority_ordered_tasks = self.get_priority_ordered_tasks()
+
+        # Classify entry and non-entry tasks
+        entry_tasks, non_entry_tasks = self.classify_entry_tasks(priority_ordered_tasks)
+
+        # Schedule entry tasks
+        self.schedule_entry_tasks(entry_tasks)
+
+        # Schedule non-entry tasks
+        self.schedule_non_entry_tasks(non_entry_tasks)
+
+        return self.sequences
+
+    def calculate_total_time(self):
+        """
+        Calculates the total completion time of the application.
+
+        Returns:
+            The application completion time
+        """
+        max_finish_time = 0
+
+        for task in self.tasks:
+            if hasattr(task, 'execution_finish_time'):
+                max_finish_time = max(max_finish_time, task.execution_finish_time)
+            elif hasattr(task, 'FT_l') and task.FT_l > 0:
+                max_finish_time = max(max_finish_time, task.FT_l)
+            elif hasattr(task, 'FT_wr') and task.FT_wr > 0:
+                max_finish_time = max(max_finish_time, task.FT_wr)
+            elif hasattr(task, 'FT_edge_receive') and task.FT_edge_receive:
+                max_finish_time = max(max_finish_time, max(task.FT_edge_receive.values()))
+
+        return max_finish_time
+
+    def calculate_total_energy(self):
+        """
+        Calculates the total energy consumption.
+
+        Returns:
+            The total energy consumption
+        """
+        total_energy = 0
+
+        # Core power consumption values
+        core_powers = [1, 2, 4]  # Example values, should be from global config
+
+        for task in self.tasks:
+            if hasattr(task, 'execution_tier'):
+                if task.execution_tier == ExecutionTier.DEVICE:
+                    # Local execution
+                    if hasattr(task, 'device_core') and 0 <= task.device_core < len(core_powers):
+                        core = task.device_core
+                        energy = core_powers[core] * task.local_execution_times[core]
+                        total_energy += energy
+
+                elif task.execution_tier == ExecutionTier.CLOUD:
+                    # Cloud offloading - only count transmission energy
+                    if hasattr(task, 'cloud_execution_times'):
+                        # E_i^c = P^s × T_i^s
+                        send_energy = rf_power.get('device_to_cloud', 0.5) * task.cloud_execution_times[0]
+                        total_energy += send_energy
+
+                elif task.execution_tier == ExecutionTier.EDGE:
+                    # Edge execution - count transmission energy
+                    if hasattr(task, 'edge_assignment') and task.edge_assignment:
+                        edge_id = task.edge_assignment.edge_id
+
+                        # Device to edge transfer
+                        d2e_key = f'device_to_edge{edge_id}'
+                        d2e_power = rf_power.get(d2e_key, 0.4)
+
+                        # Calculate transfer time
+                        d2e_data_size = task.data_sizes.get(d2e_key, 0) if hasattr(task, 'data_sizes') else 0
+                        d2e_rate = upload_rates.get(d2e_key, 1.0)
+                        d2e_time = 0 if d2e_rate == 0 else d2e_data_size / d2e_rate
+
+                        # Add upload energy
+                        total_energy += d2e_power * d2e_time
+
+                        # Edge to device transfer (results)
+                        e2d_key = f'edge{edge_id}_to_device'
+                        e2d_power = rf_power.get(e2d_key, 0.3)
+
+                        # Calculate transfer time
+                        e2d_data_size = task.data_sizes.get(e2d_key, 0) if hasattr(task, 'data_sizes') else 0
+                        e2d_rate = download_rates.get(e2d_key, 1.0)
+                        e2d_time = 0 if e2d_rate == 0 else e2d_data_size / e2d_rate
+
+                        # Add download energy
+                        total_energy += e2d_power * e2d_time
+
+        return total_energy
