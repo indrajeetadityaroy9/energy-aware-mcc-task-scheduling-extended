@@ -593,3 +593,189 @@ def total_energy(tasks, core_powers, rf_power, upload_rates, download_rates):
         calculate_energy_consumption(task, core_powers, rf_power, upload_rates, download_rates)
         for task in tasks
     )
+
+
+def primary_assignment(tasks, edge_nodes=None):
+    """
+    Extended implementation of "Primary Assignment" phase for three-tier architecture.
+    Determines which tasks should be executed on device, edge, or cloud.
+
+    Parameters:
+    - tasks: List of Task objects
+    - edge_nodes: Number of edge nodes available (default: 2)
+    """
+    if edge_nodes is None:
+        edge_nodes = M  # Use global edge nodes count from earlier code
+
+    for task in tasks:
+        # Calculate T_i^l_min (minimum local execution time)
+        t_l_min = min(task.local_execution_times)
+
+        # Calculate minimum edge execution time across all edge nodes
+        # For each edge node, find the fastest core
+        edge_times = []
+        for edge_id in range(1, edge_nodes + 1):
+            edge_cores_times = []
+            for core_id in range(1, 3):  # Assuming 2 cores per edge node
+                key = (task.id, edge_id, core_id)
+                if key in edge_execution_times:
+                    edge_cores_times.append(edge_execution_times[key])
+
+            if edge_cores_times:
+                # Calculate total edge execution time including transfers
+                min_edge_core_time = min(edge_cores_times)
+
+                # Add transfer times: device→edge + edge→device
+                d2e_key = f'device_to_edge{edge_id}'
+                e2d_key = f'edge{edge_id}_to_device'
+
+                # Data sizes for transfers
+                d2e_data_size = task.data_sizes.get(d2e_key, 0)
+                e2d_data_size = task.data_sizes.get(e2d_key, 0)
+
+                # Transfer rates
+                d2e_rate = upload_rates.get(d2e_key, 1.0)
+                e2d_rate = download_rates.get(e2d_key, 1.0)
+
+                # Calculate transfer times
+                d2e_time = 0 if d2e_rate == 0 else d2e_data_size / d2e_rate
+                e2d_time = 0 if e2d_rate == 0 else e2d_data_size / e2d_rate
+
+                # Total edge execution time = upload + processing + download
+                total_edge_time = d2e_time + min_edge_core_time + e2d_time
+                edge_times.append(total_edge_time)
+
+        # Get minimum edge execution time if any
+        t_edge_min = min(edge_times) if edge_times else float('inf')
+
+        # Calculate T_i^re (cloud execution time)
+        t_re = (task.cloud_execution_times[0] +  # T_i^s (send)
+                task.cloud_execution_times[1] +  # T_i^c (cloud)
+                task.cloud_execution_times[2])  # T_i^r (receive)
+
+        # Determine optimal execution tier
+        if t_l_min <= t_edge_min and t_l_min <= t_re:
+            # Local execution is fastest
+            task.execution_tier = ExecutionTier.DEVICE
+        elif t_edge_min <= t_l_min and t_edge_min <= t_re:
+            # Edge execution is fastest
+            task.execution_tier = ExecutionTier.EDGE
+            # Find which edge node gave this minimum time
+            for edge_id in range(1, edge_nodes + 1):
+                # Recalculate edge time for this specific edge node
+                # This is slightly redundant but ensures correct assignment
+                edge_cores_times = []
+                for core_id in range(1, 3):
+                    key = (task.id, edge_id, core_id)
+                    if key in edge_execution_times:
+                        edge_cores_times.append(edge_execution_times[key])
+
+                if edge_cores_times:
+                    min_edge_core_time = min(edge_cores_times)
+                    d2e_key = f'device_to_edge{edge_id}'
+                    e2d_key = f'edge{edge_id}_to_device'
+                    d2e_data_size = task.data_sizes.get(d2e_key, 0)
+                    e2d_data_size = task.data_sizes.get(e2d_key, 0)
+                    d2e_rate = upload_rates.get(d2e_key, 1.0)
+                    e2d_rate = download_rates.get(e2d_key, 1.0)
+                    d2e_time = 0 if d2e_rate == 0 else d2e_data_size / d2e_rate
+                    e2d_time = 0 if e2d_rate == 0 else e2d_data_size / e2d_rate
+                    total_edge_time = d2e_time + min_edge_core_time + e2d_time
+
+                    if abs(total_edge_time - t_edge_min) < 1e-9:  # Float comparison
+                        # This is the edge node with minimum time
+                        task.edge_assignment = EdgeAssignment(edge_id=edge_id, core_id=0)  # Core assigned later
+                        break
+        else:
+            # Cloud execution is fastest
+            task.execution_tier = ExecutionTier.CLOUD
+
+
+def task_prioritizing(tasks):
+    """
+    Extended implementation of "Task Prioritizing" phase for three-tier architecture.
+    Calculates priority levels for each task to determine scheduling order.
+    """
+    w = [0] * len(tasks)
+
+    # Step 1: Calculate computation costs (wi) for each task
+    for i, task in enumerate(tasks):
+        if task.execution_tier == ExecutionTier.CLOUD:
+            # For cloud tasks:
+            w[i] = (task.cloud_execution_times[0] +  # Ti^s
+                    task.cloud_execution_times[1] +  # Ti^c
+                    task.cloud_execution_times[2])  # Ti^r
+
+        elif task.execution_tier == ExecutionTier.EDGE:
+            # For edge tasks:
+            if task.edge_assignment:
+                edge_id = task.edge_assignment.edge_id
+                # Calculate average execution time across cores on this edge node
+                edge_times = []
+                for core_id in range(1, 3):  # Assuming 2 cores per edge node
+                    key = (task.id, edge_id, core_id)
+                    if key in edge_execution_times:
+                        edge_times.append(edge_execution_times[key])
+
+                if edge_times:
+                    # Average computation time on the assigned edge
+                    avg_edge_time = sum(edge_times) / len(edge_times)
+
+                    # Add transfer times
+                    d2e_key = f'device_to_edge{edge_id}'
+                    e2d_key = f'edge{edge_id}_to_device'
+                    d2e_data_size = task.data_sizes.get(d2e_key, 0)
+                    e2d_data_size = task.data_sizes.get(e2d_key, 0)
+                    d2e_rate = upload_rates.get(d2e_key, 1.0)
+                    e2d_rate = download_rates.get(e2d_key, 1.0)
+                    d2e_time = 0 if d2e_rate == 0 else d2e_data_size / d2e_rate
+                    e2d_time = 0 if e2d_rate == 0 else e2d_data_size / e2d_rate
+
+                    # Total edge execution time
+                    w[i] = d2e_time + avg_edge_time + e2d_time
+                else:
+                    # Fallback if no edge times available
+                    w[i] = float('inf')
+            else:
+                # Edge assignment missing - error case
+                w[i] = float('inf')
+
+        else:  # ExecutionTier.DEVICE
+            # For local tasks:
+            # Average computation time across all local cores
+            w[i] = sum(task.local_execution_times) / len(task.local_execution_times)
+
+    # Cache for memoization of priority calculations
+    computed_priority_scores = {}
+
+    def calculate_priority(task):
+        """
+        Recursive implementation of priority calculation.
+        Extended for three-tier architecture but follows the same principle.
+        """
+        # Memoization check
+        if task.id in computed_priority_scores:
+            return computed_priority_scores[task.id]
+
+        # Base case: Exit tasks
+        if not task.succ_tasks:  # Note: Fixed attribute name to match previous code
+            computed_priority_scores[task.id] = w[task.id - 1]
+            return w[task.id - 1]
+
+        # Recursive case: Non-exit tasks
+        max_successor_priority = 0
+        if task.succ_tasks:  # Fixed attribute name
+            max_successor_priority = max(calculate_priority(successor)
+                                         for successor in task.succ_tasks)
+
+        task_priority = w[task.id - 1] + max_successor_priority
+        computed_priority_scores[task.id] = task_priority
+        return task_priority
+
+    # Calculate priorities for all tasks using recursive algorithm
+    for task in tasks:
+        calculate_priority(task)
+
+    # Update priority scores in task objects
+    for task in tasks:
+        task.priority_score = computed_priority_scores[task.id]
