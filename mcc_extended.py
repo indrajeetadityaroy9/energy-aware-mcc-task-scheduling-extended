@@ -1623,3 +1623,132 @@ class ThreeTierTaskScheduler:
                         total_energy += e2d_power * e2d_time
 
         return total_energy
+
+
+# Main implementation for the example
+if __name__ == "__main__":
+    # Create task graph with 10 tasks as specified
+    tasks = []
+    for i in range(1, 11):
+        tasks.append(Task(id=i))
+
+    # Set task dependencies as specified in the example
+    tasks[0].pred_tasks = []
+    tasks[0].succ_tasks = [tasks[1], tasks[2], tasks[3], tasks[4], tasks[5]]
+
+    tasks[1].pred_tasks = [tasks[0]]
+    tasks[1].succ_tasks = [tasks[7], tasks[8]]
+
+    tasks[2].pred_tasks = [tasks[0]]
+    tasks[2].succ_tasks = [tasks[6]]
+
+    tasks[3].pred_tasks = [tasks[0]]
+    tasks[3].succ_tasks = [tasks[7], tasks[8]]
+
+    tasks[4].pred_tasks = [tasks[0]]
+    tasks[4].succ_tasks = [tasks[8]]
+
+    tasks[5].pred_tasks = [tasks[0]]
+    tasks[5].succ_tasks = [tasks[7]]
+
+    tasks[6].pred_tasks = [tasks[2]]
+    tasks[6].succ_tasks = [tasks[9]]
+
+    tasks[7].pred_tasks = [tasks[1], tasks[3], tasks[5]]
+    tasks[7].succ_tasks = [tasks[9]]
+
+    tasks[8].pred_tasks = [tasks[1], tasks[3], tasks[4]]
+    tasks[8].succ_tasks = [tasks[9]]
+
+    tasks[9].pred_tasks = [tasks[6], tasks[7], tasks[8]]
+    tasks[9].succ_tasks = []
+
+    # Configure task execution parameters
+    for i, task in enumerate(tasks):
+        # Set local execution times
+        task.local_execution_times = core_execution_times[i + 1]
+
+        # Set edge execution times (create faster options than local cores)
+        min_local_time = min(task.local_execution_times)
+
+        # Edge 1 cores (20% faster than local)
+        edge_execution_times[(i + 1, 1, 1)] = min_local_time * 0.8
+        edge_execution_times[(i + 1, 1, 2)] = min_local_time * 0.85
+
+        # Edge 2 cores (40% faster than local)
+        edge_execution_times[(i + 1, 2, 1)] = min_local_time * 0.6
+        edge_execution_times[(i + 1, 2, 2)] = min_local_time * 0.65
+
+        # Set data sizes for transfers
+        task.data_sizes = {
+            'device_to_edge1': 2.0,
+            'device_to_edge2': 2.0,
+            'device_to_cloud': 3.0,
+            'edge1_to_edge2': 1.5,
+            'edge2_to_edge1': 1.5,
+            'edge1_to_cloud': 2.0,
+            'edge2_to_cloud': 2.0,
+            'cloud_to_device': 1.0,
+            'edge1_to_device': 0.8,
+            'edge2_to_device': 0.8
+        }
+
+    # STEP 1: Initial Scheduling
+    print("Performing initial three-tier scheduling...")
+
+    # Phase 1: Primary assignment
+    primary_assignment(tasks)
+
+    # Phase 2: Task prioritizing
+    task_prioritizing(tasks)
+
+    # Phase 3: Execute scheduler
+    scheduler = ThreeTierTaskScheduler(tasks)
+    scheduler.execute()
+
+    # Calculate completion time and energy consumption
+    completion_time = scheduler.calculate_total_time()
+    energy = scheduler.calculate_total_energy()
+
+    print(f"INITIAL SCHEDULING APPLICATION COMPLETION TIME: {completion_time}")
+    print(f"INITIAL APPLICATION ENERGY CONSUMPTION: {energy}")
+
+    # Print initial task schedule
+    print("INITIAL TASK SCHEDULE: \n")
+    print("Task Scheduling Details:")
+    print("-" * 80)
+
+    for task in tasks:
+        print(f"\nTask ID        : {task.id}")
+
+        if task.execution_tier == ExecutionTier.DEVICE:
+            print(f"Assignment     : Core {task.device_core + 1}")
+            print(f"Execution Window: {task.RT_l:.2f} → {task.FT_l:.2f}")
+        elif task.execution_tier == ExecutionTier.CLOUD:
+            print(f"Assignment     : Cloud")
+            print(f"Send Phase     : {task.RT_ws:.2f} → {task.FT_ws:.2f}")
+            print(f"Cloud Phase    : {task.RT_c:.2f} → {task.FT_c:.2f}")
+            print(f"Receive Phase  : {task.RT_wr:.2f} → {task.FT_wr:.2f}")
+        elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+            edge_id = task.edge_assignment.edge_id
+            core_id = task.edge_assignment.core_id
+            print(f"Assignment     : Edge Node {edge_id}, Core {core_id}")
+
+            # Get device to edge transfer timing
+            d2e_key = (0, edge_id)
+            upload_finish = task.FT_edge_send.get(d2e_key, 0)
+            upload_start = max(0, upload_finish - 2)  # Approximate
+            print(f"Device→Edge    : {upload_start:.2f} → {upload_finish:.2f}")
+
+            # Get edge execution timing
+            exec_start = task.RT_edge.get(edge_id, upload_finish)
+            exec_finish = task.FT_edge.get(edge_id, 0)
+            print(f"Edge Execution : {exec_start:.2f} → {exec_finish:.2f}")
+
+            # Get edge to device transfer timing
+            e2d_key = edge_id
+            download_finish = task.FT_edge_receive.get(e2d_key, 0)
+            download_start = max(exec_finish, download_finish - 1)  # Approximate
+            print(f"Edge→Device    : {download_start:.2f} → {download_finish:.2f}")
+
+        print("-" * 40)
