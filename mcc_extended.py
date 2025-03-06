@@ -1544,27 +1544,6 @@ class ThreeTierTaskScheduler:
 
         return self.sequences
 
-    def calculate_total_time(self):
-        """
-        Calculates the total completion time of the application.
-
-        Returns:
-            The application completion time
-        """
-        max_finish_time = 0
-
-        for task in self.tasks:
-            if hasattr(task, 'execution_finish_time'):
-                max_finish_time = max(max_finish_time, task.execution_finish_time)
-            elif hasattr(task, 'FT_l') and task.FT_l > 0:
-                max_finish_time = max(max_finish_time, task.FT_l)
-            elif hasattr(task, 'FT_wr') and task.FT_wr > 0:
-                max_finish_time = max(max_finish_time, task.FT_wr)
-            elif hasattr(task, 'FT_edge_receive') and task.FT_edge_receive:
-                max_finish_time = max(max_finish_time, max(task.FT_edge_receive.values()))
-
-        return max_finish_time
-
     def calculate_total_energy(self):
         """
         Calculates the total energy consumption.
@@ -1707,8 +1686,9 @@ if __name__ == "__main__":
     scheduler.execute()
 
     # Calculate completion time and energy consumption
-    completion_time = scheduler.calculate_total_time()
-    energy = scheduler.calculate_total_energy()
+    completion_time = total_time(scheduler.tasks)
+    #energy = total_energy(scheduler.tasks, core_powers=[1, 2, 4], cloud_sending_power=0.5)
+    energy = 0
 
     print(f"INITIAL SCHEDULING APPLICATION COMPLETION TIME: {completion_time}")
     print(f"INITIAL APPLICATION ENERGY CONSUMPTION: {energy}")
