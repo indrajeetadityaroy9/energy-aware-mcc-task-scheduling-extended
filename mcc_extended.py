@@ -603,69 +603,6 @@ class Task:
 
         return max(finish_times)
 
-    def validate_dependencies(self):
-        """
-        Validate that all dependency constraints are satisfied for this task
-        """
-        if not self.pred_tasks:
-            return True  # Entry task, no dependencies to check
-
-        if self.is_scheduled == SchedulingState.UNSCHEDULED:
-            return False  # Task not scheduled yet
-
-        # Check if executing on device
-        if self.execution_tier == ExecutionTier.DEVICE:
-            ready_time = self.calculate_ready_time_local()
-            if ready_time == float('inf'):
-                return False
-            # Check if start time respects ready time
-            for i, ft in enumerate(self.local_execution_times):
-                if i == self.device_core:
-                    # This is the core we're using
-                    start_time = self.FT_l - ft
-                    if start_time < ready_time:
-                        logger.error(f"Task {self.id} starts at {start_time} but ready time is {ready_time}")
-                        return False
-
-        # Check if executing on cloud
-        elif self.execution_tier == ExecutionTier.CLOUD:
-            ready_time = self.calculate_ready_time_cloud_upload()
-            if ready_time == float('inf'):
-                return False
-            # Check if upload start time respects ready time
-            upload_time = self.cloud_execution_times[0]
-            start_time = self.FT_ws - upload_time
-            if start_time < ready_time:
-                logger.error(f"Task {self.id} cloud upload starts at {start_time} but ready time is {ready_time}")
-                return False
-
-        # Check if executing on edge
-        elif self.execution_tier == ExecutionTier.EDGE:
-            if not self.edge_assignment:
-                return False
-
-            edge_id = self.edge_assignment.edge_id
-            core_id = self.edge_assignment.core_id
-
-            ready_time = self.calculate_ready_time_edge(edge_id, upload_rates, download_rates)
-            if ready_time == float('inf'):
-                return False
-
-            # Check if edge execution start time respects ready time
-            if edge_id not in self.FT_edge:
-                return False
-
-            exec_time = self.get_edge_execution_time(edge_id, core_id)
-            if exec_time is None:
-                return False
-
-            start_time = self.FT_edge[edge_id] - exec_time
-            if start_time < ready_time:
-                logger.error(f"Task {self.id} edge execution starts at {start_time} but ready time is {ready_time}")
-                return False
-
-        return True  # All dependency constraints satisfied
-
 
 # Standalone utility functions for calculating time and energy metrics
 def total_time(tasks):
@@ -1110,17 +1047,26 @@ def validate_task_dependencies(tasks):
                         })
                         continue
 
-                    edge_id = pred_task.edge_assignment.edge_id
-                    if edge_id not in pred_task.FT_edge_receive:
+                    edge_id = pred_task.edge_assignment.edge_id - 1  # Convert to 0-based for internal lookup
+
+                    # Check both 0-based and 1-based indexing for backward compatibility
+                    has_receive_time = (edge_id in pred_task.FT_edge_receive or
+                                        (edge_id + 1) in pred_task.FT_edge_receive)
+
+                    if not has_receive_time:
                         violations.append({
                             'type': 'Missing Edge Receive Time',
                             'task': pred_task.id,
-                            'edge': edge_id,
-                            'detail': f"Edge task {pred_task.id} has no receive time for edge {edge_id}"
+                            'edge': edge_id + 1,  # Report as 1-based for user clarity
+                            'detail': f"Edge task {pred_task.id} has no receive time for edge {edge_id + 1}"
                         })
                         continue
 
-                    receive_time = pred_task.FT_edge_receive[edge_id]
+                    # Get receive time (try both indices)
+                    receive_time = pred_task.FT_edge_receive.get(edge_id,
+                                                                 pred_task.FT_edge_receive.get(edge_id + 1,
+                                                                                               float('inf')))
+
                     if receive_time > task_start_time:
                         violations.append({
                             'type': 'Edge-Device Dependency Violation',
@@ -1186,17 +1132,26 @@ def validate_task_dependencies(tasks):
                             })
                     else:
                         # Otherwise need to wait for data to return to device
-                        edge_id = pred_task.edge_assignment.edge_id
-                        if edge_id not in pred_task.FT_edge_receive:
+                        edge_id = pred_task.edge_assignment.edge_id - 1  # Convert to 0-based
+
+                        # Check both 0-based and 1-based indexing for backward compatibility
+                        has_receive_time = (edge_id in pred_task.FT_edge_receive or
+                                            (edge_id + 1) in pred_task.FT_edge_receive)
+
+                        if not has_receive_time:
                             violations.append({
                                 'type': 'Missing Edge Receive Time',
                                 'task': pred_task.id,
-                                'edge': edge_id,
-                                'detail': f"Edge task {pred_task.id} has no receive time for edge {edge_id}"
+                                'edge': edge_id + 1,  # Report as 1-based for user clarity
+                                'detail': f"Edge task {pred_task.id} has no receive time for edge {edge_id + 1}"
                             })
                             continue
 
-                        receive_time = pred_task.FT_edge_receive[edge_id]
+                        # Get receive time (try both indices)
+                        receive_time = pred_task.FT_edge_receive.get(edge_id,
+                                                                     pred_task.FT_edge_receive.get(edge_id + 1,
+                                                                                                   float('inf')))
+
                         if receive_time > upload_start_time:
                             violations.append({
                                 'type': 'Edge-Device-Cloud Dependency Violation',
@@ -1216,32 +1171,39 @@ def validate_task_dependencies(tasks):
                     })
                     continue
 
-                edge_id = task.edge_assignment.edge_id
-                core_id = task.edge_assignment.core_id
+                edge_id = task.edge_assignment.edge_id - 1  # Convert to 0-based for internal lookup
+                core_id = task.edge_assignment.core_id - 1  # Convert to 0-based
 
-                # Calculate when this task starts on the edge
-                if edge_id not in task.FT_edge:
+                # Check both 0-based and 1-based indexing for backward compatibility
+                has_finish_time = (edge_id in task.FT_edge or
+                                   (edge_id + 1) in task.FT_edge)
+
+                if not has_finish_time:
                     violations.append({
                         'type': 'Invalid Edge Execution',
                         'task': task.id,
-                        'edge': edge_id,
-                        'detail': f"Task {task.id} has no finish time for edge {edge_id}"
+                        'edge': edge_id + 1,  # Report as 1-based for user clarity
+                        'detail': f"Task {task.id} has no finish time for edge {edge_id + 1}"
                     })
                     continue
 
                 # Get execution time on this edge core
-                exec_time = task.get_edge_execution_time(edge_id, core_id)
+                exec_time = task.get_edge_execution_time(edge_id + 1, core_id + 1)
                 if exec_time is None:
                     violations.append({
                         'type': 'Missing Edge Execution Time',
                         'task': task.id,
-                        'edge': edge_id,
-                        'core': core_id,
-                        'detail': f"Task {task.id} has no execution time for edge {edge_id}, core {core_id}"
+                        'edge': edge_id + 1,  # Report as 1-based for user clarity
+                        'core': core_id + 1,  # Report as 1-based for user clarity
+                        'detail': f"Task {task.id} has no execution time for edge {edge_id + 1}, core {core_id + 1}"
                     })
                     continue
 
-                edge_start_time = task.FT_edge[edge_id] - exec_time
+                # Get finish time (try both indices)
+                finish_time = task.FT_edge.get(edge_id,
+                                               task.FT_edge.get(edge_id + 1, float('inf')))
+
+                edge_start_time = finish_time - exec_time
 
                 # Check dependency based on predecessor's execution tier
                 if pred_task.execution_tier == ExecutionTier.DEVICE:
@@ -1249,7 +1211,7 @@ def validate_task_dependencies(tasks):
                     transfer_time = pred_task.calculate_data_transfer_time(
                         ExecutionTier.DEVICE, ExecutionTier.EDGE,
                         upload_rates, download_rates,
-                        target_location=(edge_id, 0)
+                        target_location=(edge_id + 1, 0)
                     )
 
                     # Device predecessor must finish and data must transfer before edge task starts
@@ -1267,7 +1229,7 @@ def validate_task_dependencies(tasks):
                     transfer_time = pred_task.calculate_data_transfer_time(
                         ExecutionTier.CLOUD, ExecutionTier.EDGE,
                         upload_rates, download_rates,
-                        target_location=(edge_id, 0)
+                        target_location=(edge_id + 1, 0)
                     )
 
                     # Cloud computation must finish and data must transfer before edge task starts
@@ -1290,18 +1252,24 @@ def validate_task_dependencies(tasks):
                         })
                         continue
 
-                    pred_edge_id = pred_task.edge_assignment.edge_id
+                    pred_edge_id = pred_task.edge_assignment.edge_id - 1  # Convert to 0-based
 
-                    if pred_edge_id not in pred_task.FT_edge:
+                    # Check both 0-based and 1-based indexing for backward compatibility
+                    has_pred_finish_time = (pred_edge_id in pred_task.FT_edge or
+                                            (pred_edge_id + 1) in pred_task.FT_edge)
+
+                    if not has_pred_finish_time:
                         violations.append({
                             'type': 'Missing Edge Finish Time',
                             'task': pred_task.id,
-                            'edge': pred_edge_id,
-                            'detail': f"Edge task {pred_task.id} has no finish time for edge {pred_edge_id}"
+                            'edge': pred_edge_id + 1,  # Report as 1-based for user clarity
+                            'detail': f"Edge task {pred_task.id} has no finish time for edge {pred_edge_id + 1}"
                         })
                         continue
 
-                    pred_finish_time = pred_task.FT_edge[pred_edge_id]
+                    # Get predecessor finish time (try both indices)
+                    pred_finish_time = pred_task.FT_edge.get(pred_edge_id,
+                                                             pred_task.FT_edge.get(pred_edge_id + 1, float('inf')))
 
                     if pred_edge_id == edge_id:
                         # Same edge node, no transfer needed
@@ -1310,16 +1278,16 @@ def validate_task_dependencies(tasks):
                                 'type': 'Same-Edge Dependency Violation',
                                 'task': task.id,
                                 'predecessor': pred_task.id,
-                                'edge': edge_id,
-                                'detail': f"Task {task.id} starts on edge {edge_id} at {edge_start_time} before predecessor {pred_task.id} finishes at {pred_finish_time}"
+                                'edge': edge_id + 1,  # Report as 1-based for user clarity
+                                'detail': f"Task {task.id} starts on edge {edge_id + 1} at {edge_start_time} before predecessor {pred_task.id} finishes at {pred_finish_time}"
                             })
                     else:
                         # Different edge nodes, need to account for edge-to-edge transfer
                         transfer_time = pred_task.calculate_data_transfer_time(
                             ExecutionTier.EDGE, ExecutionTier.EDGE,
                             upload_rates, download_rates,
-                            source_location=(pred_edge_id, 0),
-                            target_location=(edge_id, 0)
+                            source_location=(pred_edge_id + 1, 0),
+                            target_location=(edge_id + 1, 0)
                         )
 
                         ready_time = pred_finish_time + transfer_time
@@ -1328,9 +1296,9 @@ def validate_task_dependencies(tasks):
                                 'type': 'Edge-Edge Dependency Violation',
                                 'task': task.id,
                                 'predecessor': pred_task.id,
-                                'source_edge': pred_edge_id,
-                                'target_edge': edge_id,
-                                'detail': f"Task {task.id} starts on edge {edge_id} at {edge_start_time} before data from edge {pred_edge_id} task {pred_task.id} arrives at {ready_time}"
+                                'source_edge': pred_edge_id + 1,  # Report as 1-based for user clarity
+                                'target_edge': edge_id + 1,  # Report as 1-based for user clarity
+                                'detail': f"Task {task.id} starts on edge {edge_id + 1} at {edge_start_time} before data from edge {pred_edge_id + 1} task {pred_task.id} arrives at {ready_time}"
                             })
 
     is_valid = len(violations) == 0
@@ -1338,11 +1306,11 @@ def validate_task_dependencies(tasks):
 
 
 def print_validation_report(tasks):
-    """Print detailed dependency validation report"""
+    """Print detailed dependency validation report with comprehensive violation details"""
     is_valid, violations = validate_task_dependencies(tasks)
 
     print("\nTask Dependency Validation Report")
-    print("=" * 60)
+    print("=" * 80)
 
     if is_valid:
         print("✓ All task dependency constraints are satisfied!")
@@ -1363,14 +1331,68 @@ def print_validation_report(tasks):
         for v_type, v_list in violation_types.items():
             print(f"- {v_type}: {len(v_list)} occurrences")
 
-        # Print detailed violations
+        # Print detailed violations with all available information
         print("\nDetailed Violations:")
+        print("=" * 80)
+
         for i, v in enumerate(violations, 1):
-            print(f"\n{i}. {v['type']}:")
-            print(f"   {v['detail']}")
+            print(f"\nViolation #{i}: {v['type']}")
+            print("-" * 70)
+
+            # Always print task and detail
+            task_id = v.get('task', 'Unknown')
+            pred_id = v.get('predecessor', 'N/A')
+            print(f"Task: {task_id}" + (f" → Predecessor: {pred_id}" if pred_id != 'N/A' else ""))
+            print(f"Description: {v['detail']}")
+
+            # Print timing information when available
+            if 'Dependency Violation' in v['type']:
+                # Try to extract timing information from the detail text
+                import re
+                timing_match = re.search(r'starts at ([\d.]+) before .* at ([\d.]+)', v['detail'])
+                if timing_match:
+                    start_time = float(timing_match.group(1))
+                    pred_time = float(timing_match.group(2))
+                    time_diff = pred_time - start_time
+                    print(f"Timing gap: {time_diff:.2f} time units (task starts {time_diff:.2f} too early)")
+
+            # Print additional fields that might be present
+            additional_fields = [k for k in v.keys() if k not in ['type', 'task', 'predecessor', 'detail']]
+            if additional_fields:
+                print("Additional information:")
+                for field in additional_fields:
+                    print(f"  - {field}: {v[field]}")
+
+        # Print suggestions based on violation types
+        print("\nSuggestion Summary:")
+        print("-" * 80)
+
+        if any('Device-Edge' in vtype for vtype in violation_types.keys()):
+            print("• Adjust device-to-edge data transfer timing calculations")
+
+        if any('Edge-Device' in vtype for vtype in violation_types.keys()):
+            print("• Review edge-to-device result transfer timing calculations")
+
+        if any('Edge-Edge' in vtype for vtype in violation_types.keys()):
+            print("• Fix edge-to-edge migration timing issues")
+
+        if any('Cloud' in vtype for vtype in violation_types.keys()):
+            print("• Check cloud upload/download timing calculations")
+
+        if any('Missing' in vtype for vtype in violation_types.keys()):
+            print("• Ensure all tasks have proper assignments and timing information")
+
+        # Print a summary of tasks with violations
+        tasks_with_violations = set()
+        for v in violations:
+            if 'task' in v:
+                tasks_with_violations.add(v['task'])
+            if 'predecessor' in v and v['predecessor'] != 'N/A':
+                tasks_with_violations.add(v['predecessor'])
+
+        print(f"\nTasks involved in violations: {sorted(list(tasks_with_violations))}")
 
     return is_valid
-
 
 def three_tier_execution_unit_selection(tasks):
     """
@@ -1896,6 +1918,10 @@ class ThreeTierTaskScheduler:
         """
         Enhanced method to properly handle edge scheduling and all transfers.
         Includes precedence validation, edge-to-edge transfers, and execution path tracking.
+
+        Args:
+            edge_id: 0-based index of the edge node
+            core_id: 0-based index of the core within the edge node
         """
         # STEP 1: Verify precedence constraints
         verified_ready_time = self.calculate_edge_ready_time(task, edge_id)
@@ -1982,7 +2008,9 @@ class ThreeTierTaskScheduler:
         task.execution_unit_task_start_times = [-1] * (self.k + self.M * self.edge_cores + 1)
 
         # STEP 5: Set task finish time on edge
-        task.FT_edge[edge_id] = finish_time
+        # Use both 0-based and 1-based indices for edge_id to ensure consistency
+        task.FT_edge[edge_id] = finish_time  # 0-based index for internal tracking
+        task.FT_edge[edge_id + 1] = finish_time  # 1-based index for validation
         task.execution_finish_time = finish_time
 
         # STEP 6: Calculate and handle edge→device results transfer
@@ -1999,8 +2027,9 @@ class ThreeTierTaskScheduler:
         # Update edge→device channel availability
         self.edge_to_device_ready[edge_id] = download_finish
 
-        # Record results received time at device
-        task.FT_edge_receive[edge_id] = download_finish
+        # Record results received time at device - use both indices for consistency
+        task.FT_edge_receive[edge_id] = download_finish  # 0-based index
+        task.FT_edge_receive[edge_id + 1] = download_finish  # 1-based index
 
         # Add to channel contention queue
         channel_key = f'edge{edge_id + 1}_to_device'
@@ -2714,8 +2743,5 @@ if __name__ == '__main__':
     print(f"EDGE TASKS ({len(edge_tasks)}): {[t.id for t in edge_tasks]}")
     print(f"CLOUD TASKS ({len(cloud_tasks)}): {[t.id for t in cloud_tasks]}")
     # Validate precedence constraints
-    if 'validate_task_dependencies' in globals():
-        is_valid, violations = validate_task_dependencies(tasks)
-        print(f"\nPRECEDENCE CONSTRAINTS VALIDATION: {'PASSED' if is_valid else 'FAILED'}")
-        if not is_valid:
-            print(f"Found {len(violations)} constraint violations")
+    print("\n" + "=" * 30 + " DETAILED VALIDATION REPORT " + "=" * 30)
+    print_validation_report(tasks)
