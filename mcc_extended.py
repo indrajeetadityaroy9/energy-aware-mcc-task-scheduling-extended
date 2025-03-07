@@ -1414,12 +1414,7 @@ class ThreeTierTaskScheduler:
     def __init__(self, tasks, num_cores=3, num_edge_nodes=2, edge_cores_per_node=2):
         """
         Initialize scheduler with tasks and resources across all tiers.
-
-        Args:
-            tasks: List of Task objects
-            num_cores: Number of local cores on the device
-            num_edge_nodes: Number of edge nodes (M)
-            edge_cores_per_node: Number of cores per edge node
+        Enhanced with improved channel contention handling.
         """
         self.tasks = tasks
         self.k = num_cores  # K cores from paper
@@ -1453,13 +1448,24 @@ class ThreeTierTaskScheduler:
         # Edge to edge channels (for edge-to-edge transfers)
         self.edge_to_edge_ready = [[0] * self.M for _ in range(self.M)]
 
-        # Execution sequences for all resources
-        # Indices 0..k-1: Local cores
-        # Indices k..k+M*edge_cores-1: Edge cores
-        # Index k+M*edge_cores: Cloud
-        total_resources = self.k + self.M * self.edge_cores + 1
-        self.sequences = [[] for _ in range(total_resources)]
+        # Enhanced channel contention tracking
+        self.channel_contention_queue = {
+            'device_to_cloud': [],
+            'cloud_to_device': []
+        }
 
+        # Initialize channel queues for all edge connections
+        for edge_id in range(self.M):
+            self.channel_contention_queue[f'device_to_edge{edge_id + 1}'] = []
+            self.channel_contention_queue[f'edge{edge_id + 1}_to_device'] = []
+            self.channel_contention_queue[f'edge{edge_id + 1}_to_cloud'] = []
+            self.channel_contention_queue[f'cloud_to_edge{edge_id + 1}'] = []
+
+            for other_edge in range(self.M):
+                if edge_id != other_edge:
+                    self.channel_contention_queue[f'edge{edge_id + 1}_to_edge{other_edge + 1}'] = []
+
+        # Channel locks for atomic operations
         self.channel_locks = {}
         for edge_id in range(self.M):
             self.channel_locks[f'd2e_{edge_id}'] = 0  # device→edge
@@ -1469,6 +1475,13 @@ class ThreeTierTaskScheduler:
             for other_edge in range(self.M):
                 if edge_id != other_edge:
                     self.channel_locks[f'e2e_{edge_id}_{other_edge}'] = 0
+
+        # Execution sequences for all resources
+        # Indices 0..k-1: Local cores
+        # Indices k..k+M*edge_cores-1: Edge cores
+        # Index k+M*edge_cores: Cloud
+        total_resources = self.k + self.M * self.edge_cores + 1
+        self.sequences = [[] for _ in range(total_resources)]
 
     def get_edge_core_index(self, edge_id, core_id):
         """
@@ -1880,40 +1893,99 @@ class ThreeTierTaskScheduler:
                     f"Task {task.id} starts at {task_start} before predecessor {pred_task.id} finishes at {pred_finish}")
 
     def schedule_on_edge(self, task, edge_id, core_id, start_time, finish_time):
-        """Fixed method to properly handle edge scheduling and all transfers."""
-        # Calculate device→edge upload time and channel reservation
-        data_key = f'device_to_edge{edge_id + 1}'
-        data_size = task.data_sizes.get(data_key, 0)
-        rate = upload_rates.get(data_key, 1.0)
-
-        upload_time = data_size / rate if rate > 0 else 0
-
-        # Calculate actual upload timing considering channel availability
-        upload_start = max(
-            # When data is ready to send
-            min(start_time - upload_time, 0),
-            # When channel becomes available
-            self.device_to_edge_ready[edge_id]
-        )
-        upload_finish = upload_start + upload_time
-
-        # Adjust task start time if upload delay affects it
-        actual_start = max(start_time, upload_finish)
-        if actual_start > start_time:
+        """
+        Enhanced method to properly handle edge scheduling and all transfers.
+        Includes precedence validation, edge-to-edge transfers, and execution path tracking.
+        """
+        # STEP 1: Verify precedence constraints
+        verified_ready_time = self.calculate_edge_ready_time(task, edge_id)
+        if verified_ready_time > start_time:
+            # Adjust the start time to respect precedence constraints
+            logger.warning(
+                f"Adjusting start time for task {task.id} from {start_time:.2f} to {verified_ready_time:.2f}")
+            start_time = verified_ready_time
             # Recalculate finish time
             exec_time = task.get_edge_execution_time(edge_id + 1, core_id + 1)
-            finish_time = actual_start + exec_time
+            if exec_time is None:
+                logger.error(f"No execution time data for task {task.id} on edge {edge_id + 1}, core {core_id + 1}")
+                return False
+            finish_time = start_time + exec_time
 
-        # Update device→edge channel availability
-        self.device_to_edge_ready[edge_id] = upload_finish
+        # STEP 2: Check for edge-to-edge migration
+        original_edge_id = None
+        is_migration = False
+        if task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+            original_edge_id = task.edge_assignment.edge_id - 1  # Convert to 0-based
+            if original_edge_id != edge_id:
+                is_migration = True
+                # Calculate edge-to-edge transfer time
+                data_key = f'edge{original_edge_id + 1}_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0)
+                rate = upload_rates.get(data_key, 1.0)
+                transfer_time = data_size / rate if rate > 0 else 0
 
+                # Calculate transfer timing
+                transfer_start = max(
+                    task.FT_edge.get(original_edge_id, 0),
+                    self.edge_to_edge_ready[original_edge_id][edge_id]
+                )
+                transfer_finish = transfer_start + transfer_time
+
+                # Update edge-to-edge channel availability
+                self.edge_to_edge_ready[original_edge_id][edge_id] = transfer_finish
+
+                # Adjust start time if needed to account for migration time
+                if transfer_finish > start_time:
+                    logger.warning(
+                        f"Adjusting start time for task {task.id} migration from edge {original_edge_id + 1} to {edge_id + 1}")
+                    start_time = transfer_finish
+                    finish_time = start_time + exec_time
+
+        # STEP 3: Handle device-to-edge transfer (if not migration)
+        if not is_migration:
+            # Calculate device→edge upload time and channel reservation
+            data_key = f'device_to_edge{edge_id + 1}'
+            data_size = task.data_sizes.get(data_key, 0)
+            rate = upload_rates.get(data_key, 1.0)
+
+            upload_time = data_size / rate if rate > 0 else 0
+
+            # Calculate actual upload timing considering channel availability
+            upload_start = max(
+                # When data is ready to send (account for predecessor finish time)
+                0,  # For entry tasks or migration
+                # When channel becomes available
+                self.device_to_edge_ready[edge_id]
+            )
+            upload_finish = upload_start + upload_time
+
+            # Adjust task start time if upload delay affects it
+            actual_start = max(start_time, upload_finish)
+            if actual_start > start_time:
+                # Recalculate finish time
+                exec_time = task.get_edge_execution_time(edge_id + 1, core_id + 1)
+                finish_time = actual_start + exec_time
+                start_time = actual_start
+
+            # Update device→edge channel availability
+            self.device_to_edge_ready[edge_id] = upload_finish
+
+            # Add to channel contention queue
+            channel_key = f'device_to_edge{edge_id + 1}'
+            self.channel_contention_queue[channel_key].append({
+                'task_id': task.id,
+                'start': upload_start,
+                'finish': upload_finish
+            })
+
+        # STEP 4: Initialize execution timing information
         task.execution_unit_task_start_times = [-1] * (self.k + self.M * self.edge_cores + 1)
 
-        # Set task finish time on edge
+        # STEP 5: Set task finish time on edge
         task.FT_edge[edge_id] = finish_time
         task.execution_finish_time = finish_time
 
-        # Calculate and handle edge→device results transfer
+        # STEP 6: Calculate and handle edge→device results transfer
         download_key = f'edge{edge_id + 1}_to_device'
         download_size = task.data_sizes.get(download_key, 0)
         download_rate = download_rates.get(download_key, 1.0)
@@ -1930,16 +2002,60 @@ class ThreeTierTaskScheduler:
         # Record results received time at device
         task.FT_edge_receive[edge_id] = download_finish
 
-        # Rest of method remains the same...
-        # (Set task assignment, update sequences, etc.)
+        # Add to channel contention queue
+        channel_key = f'edge{edge_id + 1}_to_device'
+        self.channel_contention_queue[channel_key].append({
+            'task_id': task.id,
+            'start': download_start,
+            'finish': download_finish
+        })
 
-        # Validation - check that we're not violating any precedence constraints
+        # STEP 7: Record execution information
+        # Record actual start time on assigned edge core
+        sequence_idx = self.get_edge_core_index(edge_id, core_id)
+        task.execution_unit_task_start_times[sequence_idx] = start_time
+
+        # Update edge core availability
+        self.edge_core_earliest_ready[edge_id][core_id] = finish_time
+
+        # STEP 8: Set task assignment
+        task.assignment = sequence_idx
+        task.execution_tier = ExecutionTier.EDGE
+        task.device_core = -1
+        task.edge_assignment = EdgeAssignment(edge_id=edge_id + 1, core_id=core_id + 1)  # Convert to 1-based
+
+        # STEP 9: Update execution path for energy calculations
+        if not task.execution_path:
+            # First assignment
+            task.execution_path = [(ExecutionTier.DEVICE, None),
+                                   (ExecutionTier.EDGE, (edge_id + 1, core_id + 1))]
+        else:
+            # Task is migrating
+            task.execution_path.append((ExecutionTier.EDGE, (edge_id + 1, core_id + 1)))
+
+        # STEP 10: Clear device and cloud finish times
+        task.FT_l = 0
+        task.FT_ws = 0
+        task.FT_c = 0
+        task.FT_wr = 0
+
+        # STEP 11: Mark task as scheduled
+        task.is_scheduled = SchedulingState.SCHEDULED
+
+        # STEP 12: Add task to execution sequence for this edge core
+        self.sequences[sequence_idx].append(task.id)
+
+        # STEP 13: Final validation - check for precedence violations
         for pred_task in task.pred_tasks:
             pred_ready_time = float('-inf')
 
             if pred_task.execution_tier == ExecutionTier.DEVICE:
                 pred_ready_time = pred_task.FT_l
             elif pred_task.execution_tier == ExecutionTier.EDGE:
+                if not pred_task.edge_assignment:
+                    logger.warning(f"Missing edge assignment for predecessor {pred_task.id}")
+                    continue
+
                 pred_edge_id = pred_task.edge_assignment.edge_id - 1
                 if pred_edge_id == edge_id:
                     pred_ready_time = pred_task.FT_edge.get(pred_edge_id, 0)
@@ -1954,11 +2070,17 @@ class ThreeTierTaskScheduler:
                     pred_ready_time = pred_finish + transfer_time
             elif pred_task.execution_tier == ExecutionTier.CLOUD:
                 # Cloud to edge transfer
-                pred_ready_time = pred_task.FT_c
+                pred_ready_time = pred_task.FT_c + task.calculate_data_transfer_time(
+                    ExecutionTier.CLOUD, ExecutionTier.EDGE,
+                    upload_rates, download_rates,
+                    target_location=(edge_id + 1, 0)
+                )
 
-            if actual_start < pred_ready_time:
+            if start_time < pred_ready_time:
                 logger.warning(
-                    f"Precedence violation: Task {task.id} starts at {actual_start} before predecessor {pred_task.id} ready at {pred_ready_time}")
+                    f"Precedence violation: Task {task.id} starts at {start_time:.2f} before predecessor {pred_task.id} ready at {pred_ready_time:.2f}")
+
+        return True
 
     def schedule_entry_tasks(self, entry_tasks):
         """
@@ -2079,14 +2201,46 @@ class ThreeTierTaskScheduler:
     def schedule_on_cloud(self, task, send_ready, send_finish, cloud_ready, cloud_finish, receive_ready,
                           receive_finish):
         """
-        Schedules a task for cloud execution, updating all timing parameters.
-
-        Args:
-            task: Task object
-            send_ready, send_finish, cloud_ready, cloud_finish, receive_ready, receive_finish:
-                Timing parameters from calculate_cloud_phases_timing
+        Enhanced method for cloud execution scheduling with improved precedence tracking.
+        Includes execution path tracking and channel contention resolution.
         """
-        # Set timing parameters for three-phase cloud execution
+        # STEP 1: Verify precedence constraints
+        verified_ready_time = self.calculate_cloud_upload_ready_time(task)
+        if verified_ready_time > send_ready:
+            # Adjust the start time to respect precedence constraints
+            logger.warning(f"Adjusting send time for task {task.id} from {send_ready:.2f} to {verified_ready_time:.2f}")
+
+            # Recalculate all timing parameters
+            send_ready = verified_ready_time
+            send_finish = send_ready + task.cloud_execution_times[0]
+            cloud_ready = send_finish
+            cloud_finish = cloud_ready + task.cloud_execution_times[1]
+            receive_ready = cloud_finish
+
+            # Determine target for results based on execution tier
+            if task.execution_tier == ExecutionTier.DEVICE:
+                # Results return to device
+                receive_finish = max(self.wr_ready, receive_ready) + task.cloud_execution_times[2]
+                self.wr_ready = receive_finish  # Update receiving channel availability
+            elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+                # Results return to edge node
+                edge_id = task.edge_assignment.edge_id - 1  # Convert to 0-based
+
+                # Calculate cloud-to-edge download time
+                data_key = f'cloud_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0)
+                rate_key = f'cloud_to_edge{edge_id + 1}'
+                rate = download_rates.get(rate_key, 1.0)
+
+                if rate > 0:
+                    download_time = data_size / rate
+                else:
+                    download_time = 0
+
+                receive_finish = max(self.cloud_to_edge_ready[edge_id], receive_ready) + download_time
+                self.cloud_to_edge_ready[edge_id] = receive_finish
+
+        # STEP 2: Set timing parameters for three-phase cloud execution
         task.RT_ws = send_ready  # When we can start sending
         task.FT_ws = send_finish  # When sending completes
 
@@ -2096,61 +2250,119 @@ class ThreeTierTaskScheduler:
         task.RT_wr = receive_ready  # When results are ready
         task.FT_wr = receive_finish  # When results are received
 
-        # Set overall execution finish time
+        # STEP 3: Set overall execution finish time
         task.execution_finish_time = receive_finish
 
-        # Initialize execution unit timing array
+        # STEP 4: Track channel usage
+        # Device to cloud channel (upload)
+        if task.execution_tier == ExecutionTier.DEVICE:
+            # Update channel contention tracking
+            self.ws_ready = send_finish  # Update sending channel
+            self.channel_contention_queue['device_to_cloud'].append({
+                'task_id': task.id,
+                'start': send_ready,
+                'finish': send_finish
+            })
+
+            # Cloud to device channel (download)
+            self.wr_ready = receive_finish  # Update receiving channel
+            self.channel_contention_queue['cloud_to_device'].append({
+                'task_id': task.id,
+                'start': receive_ready,
+                'finish': receive_finish
+            })
+        elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+            # Edge to cloud channel
+            edge_id = task.edge_assignment.edge_id - 1
+            channel_key = f'edge{edge_id + 1}_to_cloud'
+            self.channel_contention_queue[channel_key].append({
+                'task_id': task.id,
+                'start': send_ready,
+                'finish': send_finish
+            })
+
+            # Cloud to edge channel
+            channel_key = f'cloud_to_edge{edge_id + 1}'
+            self.channel_contention_queue[channel_key].append({
+                'task_id': task.id,
+                'start': receive_ready,
+                'finish': receive_finish
+            })
+
+        # STEP 5: Initialize execution start times array
         task.execution_unit_task_start_times = [-1] * (self.k + self.M * self.edge_cores + 1)
 
-        # Record cloud execution start time
+        # STEP 6: Record cloud execution start time
         cloud_idx = self.get_cloud_index()
         task.execution_unit_task_start_times[cloud_idx] = send_ready
 
-        # Set task assignment
+        # STEP 7: Set task assignment
         task.assignment = cloud_idx
         task.execution_tier = ExecutionTier.CLOUD
         task.device_core = -1
         task.edge_assignment = None
 
-        # Clear local and edge finish times
+        # STEP 8: Update execution path for energy calculations
+        previous_tier = None
+        previous_location = None
+
+        if task.execution_path:
+            if len(task.execution_path) > 0:
+                previous_tier, previous_location = task.execution_path[-1]
+
+        if not task.execution_path:
+            # First assignment - assume from device
+            task.execution_path = [(ExecutionTier.DEVICE, None), (ExecutionTier.CLOUD, None)]
+        else:
+            # Task is migrating
+            task.execution_path.append((ExecutionTier.CLOUD, None))
+
+        # STEP 9: Clear local and edge finish times
         task.FT_l = 0
         task.FT_edge = {}
         task.FT_edge_receive = {}
 
-        # Mark task as scheduled
+        # STEP 10: Mark task as scheduled
         task.is_scheduled = SchedulingState.SCHEDULED
 
-        # Add to cloud execution sequence
+        # STEP 11: Add to cloud execution sequence
         self.sequences[cloud_idx].append(task.id)
 
+        # STEP 12: Final validation - check for precedence violations
         for pred_task in task.pred_tasks:
-            pred_finish = float('inf')
+            pred_ready_time = float('-inf')
+
             if pred_task.execution_tier == ExecutionTier.DEVICE:
-                pred_finish = pred_task.FT_l
+                pred_ready_time = pred_task.FT_l
             elif pred_task.execution_tier == ExecutionTier.CLOUD:
-                pred_finish = pred_task.FT_wr if task.execution_tier == ExecutionTier.DEVICE else pred_task.FT_ws
+                pred_ready_time = pred_task.FT_ws  # For cloud-to-cloud, wait for upload to complete
             elif pred_task.execution_tier == ExecutionTier.EDGE:
+                if not pred_task.edge_assignment:
+                    logger.warning(f"Missing edge assignment for predecessor {pred_task.id}")
+                    continue
+
                 edge_id = pred_task.edge_assignment.edge_id - 1
-                if task.execution_tier == ExecutionTier.DEVICE:
-                    pred_finish = pred_task.FT_edge_receive.get(edge_id, float('inf'))
-                elif task.execution_tier == ExecutionTier.EDGE:
-                    if task.edge_assignment.edge_id - 1 == edge_id:
-                        # Same edge node
-                        pred_finish = pred_task.FT_edge.get(edge_id, float('inf'))
+
+                # Check if data was sent directly to cloud
+                cloud_key = ('edge', 'cloud')
+                if cloud_key in pred_task.FT_edge_send:
+                    pred_ready_time = pred_task.FT_edge_send[cloud_key]
+                else:
+                    # Otherwise need to wait for data to return to device
+                    if edge_id in pred_task.FT_edge_receive:
+                        pred_ready_time = pred_task.FT_edge_receive[edge_id]
                     else:
-                        # Different edge node - need transfer time
-                        pred_finish = float('inf')  # Calculate edge-to-edge transfer time
+                        pred_ready_time = pred_task.FT_edge.get(edge_id, 0) + pred_task.calculate_data_transfer_time(
+                            ExecutionTier.EDGE, ExecutionTier.DEVICE,
+                            upload_rates, download_rates,
+                            source_location=(edge_id + 1, 0)
+                        )
 
-            task_start = 0
-            if task.execution_tier == ExecutionTier.DEVICE:
-                task_start = task.execution_unit_task_start_times[task.device_core]
-            elif task.execution_tier == ExecutionTier.EDGE:
-                task_start = task.execution_unit_task_start_times[
-                    self.get_edge_core_index(task.edge_assignment.edge_id - 1, task.edge_assignment.core_id - 1)]
+            if send_ready < pred_ready_time:
+                logger.warning(
+                    f"Precedence violation: Task {task.id} starts cloud upload at {send_ready:.2f} before predecessor {pred_task.id} ready at {pred_ready_time:.2f}")
 
-            if task_start < pred_finish:
-                logger.error(
-                    f"Task {task.id} starts at {task_start} before predecessor {pred_task.id} finishes at {pred_finish}")
+        return True
 
     def calculate_cloud_phases_timing(self, task):
         """
