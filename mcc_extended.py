@@ -160,11 +160,10 @@ class TaskMigrationState:
 
 
 class Task:
-    def __init__(self, id, pred_tasks=None, succ_tasks=None):
+    def __init__(self, id, pred_task=None, succ_task=None):
         # Basic task graph structure
         self.id = id  # Task identifier v_i in DAG G=(V,E)
-        self.pred_tasks = pred_tasks or []  # pred(v_i): Immediate predecessors
-        self.succ_tasks = succ_tasks or []  # succ(v_i): Immediate successors
+        self.succ_tasks = succ_task or []  # succ(v_i): Immediate successors
 
         # ==== EXECUTION TIME PARAMETERS ====
         # Local execution times (T_i^l,k) - Section II.B
@@ -974,13 +973,14 @@ def task_prioritizing(tasks):
             task.priority_score = 0
 
 
-def validate_task_dependencies(tasks):
+def validate_task_dependencies(tasks, epsilon=1e-9):
     """
     Validate that task dependency constraints are properly maintained
-    across the three-tier architecture.
+    across the three-tier architecture, with tolerance for floating-point imprecision.
 
     Parameters:
     - tasks: List of Task objects
+    - epsilon: Small tolerance for floating-point comparisons (default: 1e-9)
 
     Returns:
     - Tuple (is_valid, violations)
@@ -1019,7 +1019,8 @@ def validate_task_dependencies(tasks):
                 # Check dependency based on predecessor's execution tier
                 if pred_task.execution_tier == ExecutionTier.DEVICE:
                     # Device predecessor must finish before task starts
-                    if pred_task.FT_l > task_start_time:
+                    # Apply floating-point tolerance
+                    if pred_task.FT_l - task_start_time > epsilon:
                         violations.append({
                             'type': 'Device-Device Dependency Violation',
                             'task': task.id,
@@ -1029,7 +1030,8 @@ def validate_task_dependencies(tasks):
 
                 elif pred_task.execution_tier == ExecutionTier.CLOUD:
                     # Cloud predecessor must return results before task starts
-                    if pred_task.FT_wr > task_start_time:
+                    # Apply floating-point tolerance
+                    if pred_task.FT_wr - task_start_time > epsilon:
                         violations.append({
                             'type': 'Cloud-Device Dependency Violation',
                             'task': task.id,
@@ -1067,7 +1069,8 @@ def validate_task_dependencies(tasks):
                                                                  pred_task.FT_edge_receive.get(edge_id + 1,
                                                                                                float('inf')))
 
-                    if receive_time > task_start_time:
+                    # Apply floating-point tolerance
+                    if receive_time - task_start_time > epsilon:
                         violations.append({
                             'type': 'Edge-Device Dependency Violation',
                             'task': task.id,
@@ -1091,7 +1094,8 @@ def validate_task_dependencies(tasks):
                 # Check dependency based on predecessor's execution tier
                 if pred_task.execution_tier == ExecutionTier.DEVICE:
                     # Device predecessor must finish before upload starts
-                    if pred_task.FT_l > upload_start_time:
+                    # Apply floating-point tolerance
+                    if pred_task.FT_l - upload_start_time > epsilon:
                         violations.append({
                             'type': 'Device-Cloud Dependency Violation',
                             'task': task.id,
@@ -1101,7 +1105,8 @@ def validate_task_dependencies(tasks):
 
                 elif pred_task.execution_tier == ExecutionTier.CLOUD:
                     # For cloud-to-cloud, only need to wait for upload to complete
-                    if pred_task.FT_ws > upload_start_time:
+                    # Apply floating-point tolerance
+                    if pred_task.FT_ws - upload_start_time > epsilon:
                         violations.append({
                             'type': 'Cloud-Cloud Dependency Violation',
                             'task': task.id,
@@ -1123,7 +1128,8 @@ def validate_task_dependencies(tasks):
                     cloud_key = ('edge', 'cloud')
                     if cloud_key in pred_task.FT_edge_send:
                         cloud_send_time = pred_task.FT_edge_send[cloud_key]
-                        if cloud_send_time > upload_start_time:
+                        # Apply floating-point tolerance
+                        if cloud_send_time - upload_start_time > epsilon:
                             violations.append({
                                 'type': 'Edge-Cloud Direct Dependency Violation',
                                 'task': task.id,
@@ -1152,7 +1158,8 @@ def validate_task_dependencies(tasks):
                                                                      pred_task.FT_edge_receive.get(edge_id + 1,
                                                                                                    float('inf')))
 
-                        if receive_time > upload_start_time:
+                        # Apply floating-point tolerance
+                        if receive_time - upload_start_time > epsilon:
                             violations.append({
                                 'type': 'Edge-Device-Cloud Dependency Violation',
                                 'task': task.id,
@@ -1216,7 +1223,8 @@ def validate_task_dependencies(tasks):
 
                     # Device predecessor must finish and data must transfer before edge task starts
                     ready_time = pred_task.FT_l + transfer_time
-                    if ready_time > edge_start_time:
+                    # Apply floating-point tolerance
+                    if ready_time - edge_start_time > epsilon:
                         violations.append({
                             'type': 'Device-Edge Dependency Violation',
                             'task': task.id,
@@ -1234,7 +1242,8 @@ def validate_task_dependencies(tasks):
 
                     # Cloud computation must finish and data must transfer before edge task starts
                     ready_time = pred_task.FT_c + transfer_time
-                    if ready_time > edge_start_time:
+                    # Apply floating-point tolerance
+                    if ready_time - edge_start_time > epsilon:
                         violations.append({
                             'type': 'Cloud-Edge Dependency Violation',
                             'task': task.id,
@@ -1273,7 +1282,8 @@ def validate_task_dependencies(tasks):
 
                     if pred_edge_id == edge_id:
                         # Same edge node, no transfer needed
-                        if pred_finish_time > edge_start_time:
+                        # Apply floating-point tolerance - key change!
+                        if pred_finish_time - edge_start_time > epsilon:
                             violations.append({
                                 'type': 'Same-Edge Dependency Violation',
                                 'task': task.id,
@@ -1291,7 +1301,8 @@ def validate_task_dependencies(tasks):
                         )
 
                         ready_time = pred_finish_time + transfer_time
-                        if ready_time > edge_start_time:
+                        # Apply floating-point tolerance
+                        if ready_time - edge_start_time > epsilon:
                             violations.append({
                                 'type': 'Edge-Edge Dependency Violation',
                                 'task': task.id,
@@ -2574,17 +2585,16 @@ class ThreeTierTaskScheduler:
 
 
 if __name__ == '__main__':
-    # Create the same task graph as before
     task10 = Task(10)
-    task9 = Task(9, succ_tasks=[task10])
-    task8 = Task(8, succ_tasks=[task10])
-    task7 = Task(7, succ_tasks=[task10])
-    task6 = Task(6, succ_tasks=[task8])
-    task5 = Task(5, succ_tasks=[task9])
-    task4 = Task(4, succ_tasks=[task8, task9])
-    task3 = Task(3, succ_tasks=[task7])
-    task2 = Task(2, succ_tasks=[task8, task9])
-    task1 = Task(1, succ_tasks=[task2, task3, task4, task5, task6])
+    task9 = Task(9, succ_task=[task10])
+    task8 = Task(8, succ_task=[task10])
+    task7 = Task(7, succ_task=[task10])
+    task6 = Task(6, succ_task=[task8])
+    task5 = Task(5, succ_task=[task9])
+    task4 = Task(4, succ_task=[task8, task9])
+    task3 = Task(3, succ_task=[task7])
+    task2 = Task(2, succ_task=[task8, task9])
+    task1 = Task(1, succ_task=[task2, task3, task4, task5, task6])
     task10.pred_tasks = [task7, task8, task9]
     task9.pred_tasks = [task2, task4, task5]
     task8.pred_tasks = [task2, task4, task6]
