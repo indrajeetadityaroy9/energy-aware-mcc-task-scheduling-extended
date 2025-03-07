@@ -1363,7 +1363,7 @@ if __name__ == '__main__':
 
     primary_assignment(tasks)
     task_prioritizing(tasks)
-    sequence = execution_unit_selection(tasks)
+    sequence = three_tier_execution_unit_selection(tasks)
     T_final = total_time(tasks)
     E_total = total_energy(tasks, core_powers=[1, 2, 4], cloud_sending_power=0.5)
     print("INITIAL SCHEDULING APPLICATION COMPLETION TIME: ", T_final)
