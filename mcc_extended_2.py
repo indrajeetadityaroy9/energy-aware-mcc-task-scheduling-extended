@@ -4050,7 +4050,7 @@ def optimize_task_scheduling_three_tier(
         initial_time: float,
         time_constraint_factor: float = 1.5,
         max_iterations: int = 50,
-        max_evaluations_per_iteration: int = 100,
+        max_evaluations_per_iteration: int = 200,
         early_stopping_threshold: float = 0.01,
         num_device_cores: int = 3,
         num_edge_nodes: int = 2,
@@ -4062,31 +4062,8 @@ def optimize_task_scheduling_three_tier(
         download_rates: Dict[str, float] = None
 ) -> Tuple[List[Any], List[List[int]], Dict[str, Any]]:
     """
-    Main optimization function for three-tier task scheduling with enhanced migration handling.
-
-    Implements an iterative energy optimization algorithm that maintains completion time
-    constraints while identifying and applying energy-efficient task migrations across
-    all three tiers (device, edge, cloud).
-
-    Args:
-        tasks: List of all tasks
-        sequences: Initial task sequences for all execution units
-        initial_time: Initial completion time to use as constraint baseline
-        time_constraint_factor: Maximum allowed increase in completion time (e.g., 1.5 = 50% increase)
-        max_iterations: Maximum number of optimization iterations
-        max_evaluations_per_iteration: Maximum migrations to evaluate per iteration
-        early_stopping_threshold: Stop if energy improvement falls below this threshold
-        num_device_cores: Number of device cores
-        num_edge_nodes: Number of edge nodes
-        num_edge_cores_per_node: Number of cores per edge node
-        device_core_powers: Power consumption of device cores
-        edge_node_powers: Power consumption of edge nodes
-        rf_power: RF power consumption rates
-        upload_rates: Upload rates between tiers
-        download_rates: Download rates between tiers
-
-    Returns:
-        Tuple (optimized_tasks, optimized_sequences, metrics)
+    Enhanced optimization function that fully exploits the three-tier architecture.
+    Considers all possible migration paths across device, edge, and cloud tiers.
     """
     # Store start time for benchmarking
     start_time = time_module.time()
@@ -4095,69 +4072,36 @@ def optimize_task_scheduling_three_tier(
     current_tasks = deepcopy(tasks)
     current_sequences = [seq.copy() for seq in sequences]
 
-    # Initialize the sequence manager and migration cache
-    sequence_manager = SequenceManager(
-        num_device_cores=num_device_cores,
-        num_edge_nodes=num_edge_nodes,
-        num_edge_cores_per_node=num_edge_cores_per_node
-    )
-    sequence_manager.set_all_sequences(current_sequences)
-
+    # Initialize the migration cache
     migration_cache = MigrationCache(capacity=20000)
-
-    # Define a simple total time calculation function
-    def calculate_total_time(tasks_list):
-        # Find exit tasks (tasks with no successors)
-        exit_tasks = [task for task in tasks_list if not task.succ_tasks]
-        if not exit_tasks:
-            exit_tasks = tasks_list  # If no explicit exit tasks, use all tasks
-
-        # Find maximum finish time across all exit tasks
-        max_finish = 0
-        for task in exit_tasks:
-            # Calculate based on execution tier
-            if task.execution_tier == ExecutionTier.DEVICE:
-                finish = task.FT_l
-            elif task.execution_tier == ExecutionTier.CLOUD:
-                finish = task.FT_wr
-            elif task.execution_tier == ExecutionTier.EDGE:
-                if task.edge_assignment and hasattr(task, 'FT_edge_receive'):
-                    edge_id = task.edge_assignment.edge_id - 1
-                    finish = task.FT_edge_receive.get(edge_id, 0)
-                else:
-                    finish = 0
-            else:
-                finish = 0
-
-            max_finish = max(max_finish, finish)
-
-        return max_finish
-
-    # Calculate initial energy consumption
-    initial_energy = total_energy_consumption_three_tier(
-        current_tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
-    )
 
     # Initialize optimization metrics
     metrics = OptimizationMetrics()
-    metrics.start(initial_time, initial_energy)
+    metrics.start(initial_time, total_energy_consumption_three_tier(
+        current_tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
+    ))
 
     # Set maximum allowed completion time
     max_time = initial_time * time_constraint_factor
 
-    # Validate constraints before optimization
+    # Validate initial schedule
     valid, violations = validate_task_dependencies(current_tasks)
     if not valid:
-        logger.error("Initial schedule has dependency violations! Optimization may fail.")
-        for v in violations[:5]:  # Show first 5 violations
-            logger.error(f"Violation: {v['type']} - {v['detail']}")
+        logger.warning("Initial schedule has dependency violations! Attempting to fix...")
+        three_tier_kernel_algorithm(
+            current_tasks, current_sequences,
+            num_device_cores, num_edge_nodes, num_edge_cores_per_node
+        )
+        valid, violations = validate_task_dependencies(current_tasks)
+        if not valid:
+            logger.error("Unable to fix dependency violations. Optimization may fail.")
 
     # Main optimization loop
     energy_improved = True
     consecutive_no_improvement = 0
 
     logger.info(f"Starting optimization with {len(current_tasks)} tasks")
-    logger.info(f"Initial metrics - Time: {initial_time:.2f}, Energy: {initial_energy:.2f}")
+    logger.info(f"Initial metrics - Time: {metrics.initial_time:.2f}, Energy: {metrics.initial_energy:.2f}")
 
     for iteration in range(max_iterations):
         # Break if no energy improvement for multiple iterations
@@ -4165,92 +4109,109 @@ def optimize_task_scheduling_three_tier(
             logger.info(f"Early stopping after {iteration} iterations (no improvement)")
             break
 
-        # Store current energy for comparison
+        # Store current energy and time for comparison
         previous_energy = metrics.current_energy
+        previous_time = metrics.current_time
 
-        # Initialize migration choices
+        # Initialize migration choices matrix for all possible migrations
         migration_choices = initialize_migration_choices_three_tier(
             current_tasks, num_device_cores, num_edge_nodes, num_edge_cores_per_node
         )
 
-        # Evaluate all possible migrations
+        # Identify tasks on the critical path for prioritized evaluation
+        critical_tasks = identify_critical_path_tasks(current_tasks, total_time)
+
+        # Prioritize tasks for migration based on potential energy reduction
+        task_priorities = prioritize_tasks_for_migration(
+            current_tasks, migration_choices,
+            device_core_powers, edge_node_powers,
+            critical_tasks
+        )
+
+        # Create prioritized search space for efficient exploration
+        search_space = create_prioritized_search_space(
+            task_priorities, migration_choices,
+            num_device_cores, num_edge_nodes, num_edge_cores_per_node,
+            max_evaluations_per_iteration
+        )
+
+        logger.info(f"Iteration {iteration + 1}: Evaluating {len(search_space)} prioritized migrations")
+
+        # Batch evaluate migrations for improved efficiency
         migration_results = []
-        for task_idx in range(len(current_tasks)):
-            task = current_tasks[task_idx]
+        batch_size = 20  # Set batch size for parallel evaluation
 
-            # Skip already scheduled cloud tasks
-            if task.execution_tier == ExecutionTier.CLOUD:
-                continue
+        for i in range(0, len(search_space), batch_size):
+            batch = search_space[i:i + batch_size]
 
-            # For each task, try migrating to cloud first
-            cloud_index = num_device_cores + (num_edge_nodes * num_edge_cores_per_node)
+            for task_idx, target_unit_index in batch:
+                # Evaluate this migration
+                migration_time, migration_energy = evaluate_migration_three_tier(
+                    current_tasks, current_sequences, task_idx, target_unit_index,
+                    migration_cache, three_tier_kernel_algorithm, construct_sequence_three_tier,
+                    total_energy_consumption_three_tier, total_time,
+                    num_device_cores, num_edge_nodes, num_edge_cores_per_node,
+                    device_core_powers, edge_node_powers, rf_power,
+                    upload_rates, download_rates
+                )
 
-            # Skip if task is already on cloud or migration choice isn't valid
-            if not migration_choices[task_idx][cloud_index]:
-                continue
+                # Add to results if valid
+                if migration_time < float('inf') and migration_energy < float('inf'):
+                    migration_results.append((task_idx, target_unit_index, migration_time, migration_energy))
 
-            # Evaluate migration to cloud
-            migration_time, migration_energy = evaluate_migration_three_tier(
-                current_tasks, current_sequences, task_idx, cloud_index,
-                migration_cache, three_tier_kernel_algorithm, construct_sequence_three_tier,
-                total_energy_consumption_three_tier, calculate_total_time,
-                num_device_cores, num_edge_nodes, num_edge_cores_per_node,
-                device_core_powers, edge_node_powers, rf_power,
-                upload_rates, download_rates
-            )
+                # Stop if we've reached evaluation limit
+                if len(migration_results) >= max_evaluations_per_iteration:
+                    break
 
-            # Add to results
-            migration_results.append((task_idx, cloud_index, migration_time, migration_energy))
-
-            # Limit evaluations per iteration
+            # Stop batch processing if we've reached evaluation limit
             if len(migration_results) >= max_evaluations_per_iteration:
                 break
 
-        # Find the best migration option
+        logger.info(f"Completed {len(migration_results)} migration evaluations")
+
+        # Find the best migration option using the advanced selection criteria
         best_migration = identify_optimal_migration_three_tier(
-            migration_trials_results=migration_results,
-            current_time=metrics.current_time,
-            current_energy=metrics.current_energy,
-            max_time=max_time
+            migration_results,
+            metrics.current_time,
+            metrics.current_energy,
+            max_time,
         )
 
         # Update metrics with evaluation count
-        evaluations = len(migration_results)
+        metrics.update(metrics.current_time, metrics.current_energy, len(migration_results))
 
         # Check if a valid migration was found
         if best_migration is None:
             logger.info(f"Iteration {iteration + 1}: No valid migration found")
             consecutive_no_improvement += 1
-            metrics.update(metrics.current_time, metrics.current_energy, evaluations)
             continue
 
         # Apply the selected migration
         task_id = best_migration.task_id
 
-        # Get target execution unit
+        # Get target execution unit details
         if best_migration.target_tier == ExecutionTier.DEVICE:
+            if best_migration.target_location is None:
+                logger.error(f"Missing target location for device migration of task {task_id}")
+                consecutive_no_improvement += 1
+                continue
             target_core = best_migration.target_location[0]
             target_unit_index = target_core
         elif best_migration.target_tier == ExecutionTier.EDGE:
+            if best_migration.target_location is None:
+                logger.error(f"Missing target location for edge migration of task {task_id}")
+                consecutive_no_improvement += 1
+                continue
             node_id, core_id = best_migration.target_location
             target_unit_index = num_device_cores + (node_id * num_edge_cores_per_node) + core_id
         else:  # Cloud
             target_unit_index = num_device_cores + (num_edge_nodes * num_edge_cores_per_node)
 
-        # Log migration details
-        logger.info(f"Iteration {iteration + 1}: Migrating task {task_id} to {best_migration.target_tier.name} " +
-                    f"(unit index: {target_unit_index})")
+        # Log migration details with source and target information
+        logger.info(f"Iteration {iteration + 1}: Migrating task {task_id} from {best_migration.source_tier.name} to "
+                    f"{best_migration.target_tier.name} (unit index: {target_unit_index})")
 
         try:
-            # Verify the migration actually worked by calculating energy
-            pre_migration_energy = total_energy_consumption_three_tier(
-                current_tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
-            )
-
-            # Get original task state for debugging
-            task = next((t for t in current_tasks if t.id == task_id), None)
-            original_tier = task.execution_tier if task else None
-
             # Apply the migration
             current_sequences = construct_sequence_three_tier(
                 current_tasks, task_id, target_unit_index, current_sequences,
@@ -4263,118 +4224,57 @@ def optimize_task_scheduling_three_tier(
                 num_device_cores, num_edge_nodes, num_edge_cores_per_node
             )
 
-            # Calculate post-migration energy
-            post_migration_energy = total_energy_consumption_three_tier(
-                current_tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
-            )
-
-            # Verify energy improvement actually occurred
-            energy_diff = pre_migration_energy - post_migration_energy
-            logger.info(
-                f"Migration energy change: {pre_migration_energy:.2f} → {post_migration_energy:.2f} (Diff: {energy_diff:.2f})")
-
-            # Verify task was actually migrated
-            new_task = next((t for t in current_tasks if t.id == task_id), None)
-            new_tier = new_task.execution_tier if new_task else None
-
-            if original_tier == new_tier:
-                logger.error(f"Migration failed: Task {task_id} still at tier {new_tier}")
-                # Force the migration directly as a fallback
-                if new_task and best_migration.target_tier == ExecutionTier.CLOUD:
-                    logger.info(f"Forcing migration of task {task_id} to cloud")
-                    new_task.execution_tier = ExecutionTier.CLOUD
-                    new_task.device_core = -1
-                    new_task.edge_assignment = None
-                    new_task.FT_l = 0
-                    # Set cloud timing
-                    new_task.RT_ws = 0
-                    new_task.FT_ws = 3.0
-                    new_task.RT_c = 3.0
-                    new_task.FT_c = 4.0
-                    new_task.RT_wr = 4.0
-                    new_task.FT_wr = 5.0
-                    # Remove from device/edge sequence
-                    for seq_idx, seq in enumerate(
-                            current_sequences[:num_device_cores + (num_edge_nodes * num_edge_cores_per_node)]):
-                        if task_id in seq:
-                            current_sequences[seq_idx].remove(task_id)
-                            break
-                    # Add to cloud sequence
-                    cloud_idx = num_device_cores + (num_edge_nodes * num_edge_cores_per_node)
-                    if task_id not in current_sequences[cloud_idx]:
-                        current_sequences[cloud_idx].append(task_id)
-
-                    # Run kernel again to fix dependencies
-                    three_tier_kernel_algorithm(
-                        current_tasks, current_sequences,
-                        num_device_cores, num_edge_nodes, num_edge_cores_per_node
-                    )
-
-                    # Recalculate energy
-                    post_migration_energy = total_energy_consumption_three_tier(
-                        current_tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
-                    )
-                    energy_diff = pre_migration_energy - post_migration_energy
-                    logger.info(
-                        f"After forced migration: {pre_migration_energy:.2f} → {post_migration_energy:.2f} (Diff: {energy_diff:.2f})")
-
-            if energy_diff <= 0:
-                logger.warning(f"Migration didn't reduce energy! Investigating task {task_id}...")
-                # Debug task state
-                task = next((t for t in current_tasks if t.id == task_id), None)
-                if task:
-                    logger.info(f"Task {task_id} tier: {task.execution_tier}")
-                    # Add more debug info
-                    if task.execution_tier == ExecutionTier.CLOUD:
-                        cloud_timing = f"Cloud timing - RT_ws: {task.RT_ws}, FT_ws: {task.FT_ws}, FT_c: {task.FT_c}, FT_wr: {task.FT_wr}"
-                        logger.info(cloud_timing)
-
-            # Validate constraints after migration
-            if not validate_task_dependencies(current_tasks)[0]:
-                logger.warning(f"Constraint violation after migrating task {task_id}!")
-                # Try to recover by re-running kernel algorithm
-                three_tier_kernel_algorithm(
-                    current_tasks, current_sequences,
-                    num_device_cores, num_edge_nodes, num_edge_cores_per_node
-                )
-
             # Calculate new metrics
-            new_time = calculate_total_time(current_tasks)
+            new_time = total_time(current_tasks)
             new_energy = total_energy_consumption_three_tier(
                 current_tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
             )
 
             # Update metrics
-            metrics.update(new_time, new_energy, evaluations)
+            metrics.update(new_time, new_energy)
 
             # Check if energy improved
             energy_improved = new_energy < previous_energy
 
             if energy_improved:
+                # Log successful migration
+                energy_reduction = previous_energy - new_energy
+                energy_reduction_pct = (energy_reduction / previous_energy) * 100
+                time_change = new_time - previous_time
+                time_change_pct = (time_change / previous_time) * 100
+
+                logger.info(f"Migration successful: Energy: {previous_energy:.2f} → {new_energy:.2f} "
+                            f"({energy_reduction_pct:.2f}%), Time: {previous_time:.2f} → {new_time:.2f} "
+                            f"({time_change_pct:+.2f}%)")
+
                 # Reset counter for consecutive non-improvements
                 consecutive_no_improvement = 0
 
-                # Calculate relative improvement
-                relative_improvement = (previous_energy - new_energy) / previous_energy
-
-                logger.info(
-                    f"Iteration {iteration + 1}: Energy improved from {previous_energy:.2f} to {new_energy:.2f} "
-                    f"({relative_improvement * 100:.2f}%), Time: {new_time:.2f}")
-
-                # Check for early stopping
+                # Check for early stopping based on relative improvement
+                relative_improvement = energy_reduction / previous_energy
                 if relative_improvement < early_stopping_threshold:
                     consecutive_no_improvement += 1
             else:
+                # Migration didn't improve energy
+                logger.warning(f"Migration did not improve energy: {previous_energy:.2f} → {new_energy:.2f}")
                 consecutive_no_improvement += 1
-                logger.info(f"Iteration {iteration + 1}: No energy improvement")
+
+            # Validate schedule after migration
+            valid, _ = validate_task_dependencies(current_tasks)
+            if not valid:
+                logger.warning(f"Schedule has dependency violations after migration. Fixing...")
+                three_tier_kernel_algorithm(
+                    current_tasks, current_sequences,
+                    num_device_cores, num_edge_nodes, num_edge_cores_per_node
+                )
 
         except Exception as e:
-            logger.error(f"Error during migration: {e}")
+            logger.error(f"Error during migration: {str(e)}")
             consecutive_no_improvement += 1
             continue
 
     # Calculate final metrics
-    final_time = calculate_total_time(current_tasks)
+    final_time = total_time(current_tasks)
     final_energy = total_energy_consumption_three_tier(
         current_tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
     )
@@ -4384,7 +4284,7 @@ def optimize_task_scheduling_three_tier(
 
     # Calculate overall improvements
     time_change = (final_time - initial_time) / initial_time * 100
-    energy_reduction = (initial_energy - final_energy) / initial_energy * 100
+    energy_reduction = (metrics.initial_energy - final_energy) / metrics.initial_energy * 100
 
     # Log optimization summary
     logger.info(f"Optimization completed in {time_module.time() - start_time:.2f} seconds")
@@ -4449,9 +4349,7 @@ def construct_sequence_three_tier(tasks, task_id, target_unit_index, sequences,
         logger.error(f"Task {task_id} not found for migration")
         return sequences
 
-    target_unit = get_execution_unit_from_index(
-        target_unit_index, num_device_cores, num_edge_nodes, num_edge_cores_per_node
-    )
+    target_unit = get_execution_unit_from_index(target_unit_index)
 
     # Find and remove the task from its current sequence.
     source_index = next((idx for idx, seq in enumerate(sequences) if task_id in seq), -1)
@@ -4881,26 +4779,28 @@ def create_prioritized_search_space(task_priorities: Dict[int, float],
 def identify_optimal_migration_three_tier(migration_trials_results: List[Tuple],
                                           current_time: float,
                                           current_energy: float,
-                                          max_time: float,
-                                          priority_energy_reduction: bool = True) -> Optional[TaskMigrationState]:
+                                          max_time: float) -> Optional[TaskMigrationState]:
     """
-    Identifies optimal task migration with preference for edge execution when sensible.
+    Enhanced migration selection that properly balances migrations across all tiers.
 
-    Args:
-        migration_trials_results: List of (task_idx, target_unit_index, migration_time, migration_energy) tuples
-        current_time: Current total completion time
-        current_energy: Current total energy consumption
-        max_time: Maximum allowable completion time
-        priority_energy_reduction: Whether to prioritize energy reduction over other factors
-
-    Returns:
-        TaskMigrationState for the optimal migration, or None if no valid migration found
+    This function follows the two-phase approach of the MCC algorithm:
+    1. The initial scheduling already optimized for time
+    2. This phase (migration) optimizes for energy while respecting time constraints
     """
+    if not migration_trials_results:
+        return None
+
     logger.info(f"Evaluating {len(migration_trials_results)} possible migrations")
-    allowed_time_increase = current_time * 0.5  # Allow 50% time increase
 
-    # Step 1: Filter and prepare candidate migrations
+    # Allow time to increase by up to 20% if it results in energy reduction
+    allowed_time_increase = max(0.2 * current_time, max_time - current_time)
+
+    # Create tier statistics for analysis
+    tier_counts = {0: 0, 1: 0, 2: 0}  # Using the enum values directly: 0=DEVICE, 1=EDGE, 2=CLOUD
+
+    # Step 1: Prepare and filter candidate migrations
     candidate_migrations = []
+
     for task_idx, target_unit_index, migration_time, migration_energy in migration_trials_results:
         # Skip invalid migrations
         if migration_time == float('inf') or migration_energy == float('inf'):
@@ -4908,144 +4808,97 @@ def identify_optimal_migration_three_tier(migration_trials_results: List[Tuple],
 
         task_id = task_idx + 1
         energy_reduction = current_energy - migration_energy
-        time_increase = migration_time - current_time
-        time_improvement = current_time - migration_time
+        time_increase = max(0, migration_time - current_time)
 
-        # Only consider migrations that reduce energy and don't exceed time constraints
-        if energy_reduction > 0 and time_increase <= allowed_time_increase:
-            # Get source and target execution units
-            source_unit = get_current_execution_unit(tasks[task_idx])
-            target_unit = get_execution_unit_from_index(
-                target_unit_index,
-                globals().get('num_device_cores', 3),
-                globals().get('num_edge_nodes', 2),
-                globals().get('num_edge_cores_per_node', 2)
-            )
+        # Skip migrations that exceed time constraints or don't reduce energy
+        if time_increase > allowed_time_increase or energy_reduction <= 0:
+            continue
 
-            # Calculate edge preference score
-            edge_preference = 0.0
-            if target_unit.tier == ExecutionTier.EDGE:
-                # Retrieve the task object
-                task = tasks[task_idx] if task_idx < len(tasks) else None
+        # Get source and target execution units
+        task = next((t for t in tasks if t.id == task_id), None)
+        if not task:
+            continue
 
-                if task:
-                    # Factor 1: Task computation profile
-                    if hasattr(task, 'local_execution_times') and task.local_execution_times:
-                        avg_local_time = sum(task.local_execution_times) / len(task.local_execution_times)
-                        # Medium computation tasks (3-8 time units) are good edge candidates
-                        if 3 <= avg_local_time <= 8:
-                            edge_preference += 0.2
+        source_unit = get_current_execution_unit(task)
+        target_unit = get_execution_unit_from_index(target_unit_index)
 
-                    # Factor 2: Data transfer profile
-                    if hasattr(task, 'data_sizes'):
-                        # Tasks with higher input than output data are good edge candidates
-                        edge_id = target_unit.location[0] + 1  # Convert to 1-based
-                        input_key = f'device_to_edge{edge_id}'
-                        output_key = f'edge{edge_id}_to_device'
+        # Track target tier statistics
+        tier_counts[target_unit.tier.value] += 1
 
-                        input_size = task.data_sizes.get(input_key, 0)
-                        output_size = task.data_sizes.get(output_key, 0)
+        # Calculate edge preference score based on task characteristics
+        edge_preference = calculate_edge_suitability(task, upload_rates, download_rates)
 
-                        if input_size > 0 and output_size > 0:
-                            if input_size > output_size:
-                                edge_preference += 0.15
-                            # Especially good when input is much larger than output
-                            if input_size > output_size * 2:
-                                edge_preference += 0.15
+        # Calculate efficiency score (energy reduction per unit time increase)
+        efficiency = energy_reduction
+        if time_increase > 0:
+            efficiency = energy_reduction / time_increase
 
-                    # Factor 3: Dependency locality
-                    if hasattr(task, 'pred_tasks'):
-                        edge_predecessors = 0
-                        for pred in task.pred_tasks:
-                            if (hasattr(pred, 'execution_tier') and
-                                    pred.execution_tier == ExecutionTier.EDGE and
-                                    hasattr(pred, 'edge_assignment') and
-                                    pred.edge_assignment):
-                                # Especially valuable if predecessor is on same edge node
-                                if pred.edge_assignment.edge_id == edge_id:
-                                    edge_predecessors += 2
-                                else:
-                                    edge_predecessors += 1
+        # Calculate tier transition complexity (same tier = 1, adjacent tiers = 2, device-cloud = 3)
+        transition_complexity = abs(source_unit.tier.value - target_unit.tier.value) + 1
 
-                        edge_preference += min(0.3, 0.1 * edge_predecessors)
+        # Calculate final score with tier-specific bonuses
+        tier_bonus = 0
 
-                    # Factor 4: Successor locality
-                    if hasattr(task, 'succ_tasks'):
-                        candidates_for_edge = 0
-                        for succ in task.succ_tasks:
-                            # Successors with similar characteristics to this task
-                            # are potential edge candidates
-                            if hasattr(succ, 'local_execution_times') and succ.local_execution_times:
-                                avg_succ_time = sum(succ.local_execution_times) / len(succ.local_execution_times)
-                                if 3 <= avg_succ_time <= 8:
-                                    candidates_for_edge += 1
+        # Give edge tier a slight bonus when appropriate to encourage edge utilization
+        if target_unit.tier.value == 1 and edge_preference > 0.3:  # EDGE = 1
+            tier_bonus = 0.1 * energy_reduction
 
-                        edge_preference += min(0.2, 0.05 * candidates_for_edge)
+        # Calculate overall score
+        final_score = efficiency + tier_bonus - (0.05 * transition_complexity * energy_reduction)
 
-            # Add to candidates with edge preference factored in
-            candidate_migrations.append({
-                'task_id': task_id,
-                'energy_reduction': energy_reduction,
-                'time_increase': time_increase,
-                'time_improvement': time_improvement,
-                'migration_time': migration_time,
-                'migration_energy': migration_energy,
-                'target_unit_index': target_unit_index,
-                'source_unit': source_unit,
-                'target_unit': target_unit,
-                'edge_preference': edge_preference
-            })
+        # Add to candidate list
+        candidate_migrations.append({
+            'task_id': task_id,
+            'energy_reduction': energy_reduction,
+            'time_increase': time_increase,
+            'migration_time': migration_time,
+            'migration_energy': migration_energy,
+            'source_unit': source_unit,
+            'target_unit': target_unit,
+            'edge_preference': edge_preference,
+            'score': final_score,
+            'transition_complexity': transition_complexity
+        })
 
-    # Step 2: Decide on sorting strategy
     if not candidate_migrations:
-        logger.info("No suitable migration found")
         return None
 
-    # Step 3: Create combined scoring for candidates
-    for candidate in candidate_migrations:
-        # Base score is energy reduction
-        base_score = candidate['energy_reduction']
+    # Log tier distribution for analysis
+    logger.info(f"Migration candidates by tier: Device={tier_counts[0]}, "
+                f"Edge={tier_counts[1]}, Cloud={tier_counts[2]}")
 
-        # Add edge preference as a percentage boost (up to 10%)
-        # This makes edge slightly preferred when energy savings are close
-        edge_bonus = base_score * candidate['edge_preference'] * 0.1
-
-        # Add time improvement as a small bonus (up to 5%)
-        time_bonus = 0
-        if candidate['time_improvement'] > 0:
-            time_bonus = base_score * min(0.05, candidate['time_improvement'] / current_time)
-
-        # Calculate final score
-        candidate['score'] = base_score + edge_bonus + time_bonus
-
-    # Sort candidates by score (highest first)
+    # Sort by final score (highest first)
     candidate_migrations.sort(key=lambda x: x['score'], reverse=True)
 
-    # Step 4: Select and return the best migration
+    # Take the best migration
     best = candidate_migrations[0]
 
     # Log selection details
-    if best['target_unit'].tier == ExecutionTier.EDGE:
-        edge_id, core_id = best['target_unit'].location
-        logger.info(f"Selected migration: Task {best['task_id']} to EDGE (node {edge_id + 1}, core {core_id + 1}) "
-                    f"with energy reduction {best['energy_reduction']:.2f} "
-                    f"(edge preference: {best['edge_preference']:.2f})")
-    else:
-        logger.info(f"Selected migration: Task {best['task_id']} to {best['target_unit'].tier.name} "
-                    f"with energy reduction {best['energy_reduction']:.2f}")
+    source_tier = best['source_unit'].tier
+    target_tier = best['target_unit'].tier
 
-    # Create and return the migration state
+    if target_tier.value == 1:  # EDGE = 1
+        edge_id, core_id = best['target_unit'].location
+        logger.info(
+            f"Selected: Task {best['task_id']} {source_tier.name} → EDGE(node {edge_id + 1}, core {core_id + 1}) "
+            f"Energy reduction: {best['energy_reduction']:.2f} (Score: {best['score']:.2f})")
+    else:
+        logger.info(f"Selected: Task {best['task_id']} {source_tier.name} → {target_tier.name} "
+                    f"Energy reduction: {best['energy_reduction']:.2f} (Score: {best['score']:.2f})")
+
+    # Create and return migration state
     return TaskMigrationState(
         time=best['migration_time'],
         energy=best['migration_energy'],
-        efficiency=best['energy_reduction'] / max(0.1, best['time_increase']),
+        efficiency=best['score'],
         task_id=best['task_id'],
-        source_tier=best['source_unit'].tier,
-        target_tier=best['target_unit'].tier,
+        source_tier=source_tier,
+        target_tier=target_tier,
         source_location=best['source_unit'].location,
         target_location=best['target_unit'].location,
         energy_reduction=best['energy_reduction'],
-        time_increase=best['time_increase']
+        time_increase=best['time_increase'],
+        migration_complexity=best['transition_complexity']
     )
 
 
@@ -5100,20 +4953,15 @@ def initialize_edge_execution_times():
     return edge_execution_times
 
 
-def get_execution_unit_from_index(index: int, num_device_cores: int,
-                                  num_edge_nodes: int, num_edge_cores_per_node: int) -> ExecutionUnit:
+def get_execution_unit_from_index(index: int) -> ExecutionUnit:
     """
-    Converts a linear index to an ExecutionUnit.
-
-    Args:
-        index: Linear index into the execution units
-        num_device_cores: Number of device cores
-        num_edge_nodes: Number of edge nodes
-        num_edge_cores_per_node: Number of cores per edge node
-
-    Returns:
-        ExecutionUnit corresponding to the index
+    Converts a linear index to an ExecutionUnit using globally available parameters.
     """
+    # Get the structure parameters from globals or use defaults
+    num_device_cores = globals().get('num_device_cores', 3)
+    num_edge_nodes = globals().get('num_edge_nodes', 2)
+    num_edge_cores_per_node = globals().get('num_edge_cores_per_node', 2)
+
     # Device cores
     if index < num_device_cores:
         return ExecutionUnit(ExecutionTier.DEVICE, (index,))
@@ -5283,12 +5131,7 @@ def evaluate_migration_three_tier(tasks,
     source_unit = get_current_execution_unit(tasks[task_idx])
 
     # Step 2: Get target execution unit from index
-    target_unit = get_execution_unit_from_index(
-        target_unit_index,
-        num_device_cores,
-        num_edge_nodes,
-        num_edge_cores_per_node
-    )
+    target_unit = get_execution_unit_from_index(target_unit_index)
 
     # Step 3: Check if this migration has been evaluated before
     cache_key = generate_migration_cache_key(
