@@ -57,40 +57,6 @@ cloud_execution_times = [3, 1, 1]
 # Number of edge nodes in the system
 M = 2  # M edge nodes {E_1, E_2, ..., E_M}
 
-# Communication rates and data sizes for the extended three-tier model
-# Upload rates between tiers (in data units per time unit)
-upload_rates = {
-    'device_to_edge1': 2.0,  # R^s_{d→e1}
-    'device_to_edge2': 1.8,  # R^s_{d→e2}
-    'device_to_cloud': 1.5,  # R^s (original rate)
-    'edge1_to_edge2': 3.0,  # R^s_{e1→e2}
-    'edge2_to_edge1': 3.0,  # R^s_{e2→e1}
-    'edge1_to_cloud': 4.0,  # R^s_{e1→c}
-    'edge2_to_cloud': 3.8  # R^s_{e2→c}
-}
-
-# Download rates between tiers
-download_rates = {
-    'cloud_to_device': 2.0,  # R^r (original rate)
-    'cloud_to_edge1': 4.5,  # R^r_{c→e1}
-    'cloud_to_edge2': 4.2,  # R^r_{c→e2}
-    'edge1_to_device': 3.0,  # R^r_{e1→d}
-    'edge2_to_device': 2.8  # R^r_{e2→d}
-}
-
-# Power consumption for RF communication
-rf_power = {
-    'device_to_edge1': 0.4,  # P^s_{d→e1}
-    'device_to_edge2': 0.45,  # P^s_{d→e2}
-    'device_to_cloud': 0.5,  # P^s (original)
-    'edge1_to_edge2': 0.3,  # P^s_{e1→e2}
-    'edge2_to_edge1': 0.3,  # P^s_{e2→e1}
-    'edge1_to_cloud': 0.4,  # P^s_{e1→c}
-    'edge2_to_cloud': 0.42,  # P^s_{e2→c}
-    'edge1_to_device': 0.3,  # P^s_{e1→d}
-    'edge2_to_device': 0.35  # P^s_{e2→d}
-}
-
 # Data size configurations for tasks
 # Key: task_id
 # Value: dict of data sizes for different transfer paths
@@ -2527,8 +2493,31 @@ class Task:
 
     def get_edge_execution_time(self, edge_id, core_id):
         """Get the execution time for a specific edge node and core"""
-        key = (edge_id, core_id)
-        return self.edge_execution_times.get(key)
+        # Try task-specific edge execution times first
+        key = (self.id, edge_id, core_id)
+        if 'edge_execution_times' in globals() and key in edge_execution_times:
+            return edge_execution_times[key]
+
+        # Next try the task's own execution times dictionary
+        if hasattr(self, 'edge_execution_times'):
+            key = (edge_id, core_id)
+            if key in self.edge_execution_times:
+                return self.edge_execution_times[key]
+
+        # Calculate a reasonable fallback based on local execution times
+        if hasattr(self, 'local_execution_times') and self.local_execution_times:
+            # For data-intensive tasks (odd IDs), edge is slightly faster
+            if self.id % 2 == 1:
+                avg_local = sum(self.local_execution_times) / len(self.local_execution_times)
+                return avg_local * 0.9
+            # For compute-intensive tasks, edge is between device and cloud
+            else:
+                min_local = min(self.local_execution_times)
+                cloud_time = sum(self.cloud_execution_times)
+                return (min_local + cloud_time) / 2
+
+        # Ultimate fallback
+        return 5.0
 
     def calculate_data_transfer_time(self, source_tier, target_tier,
                                      upload_rates_dict, download_rates_dict,
@@ -2871,15 +2860,15 @@ def primary_assignment(tasks, edge_nodes=None):
         # Compute minimum local execution time
         t_l_min = min(task.local_execution_times) if task.local_execution_times else float('inf')
 
-        # Compute minimum edge execution time (using available edge data)
+        # Compute minimum edge execution time
         t_edge_min = float('inf')
         best_edge_id = -1
         best_core_id = -1
         for edge_id in range(1, edge_nodes + 1):
             for core_id in range(1, 3):  # Assuming 2 cores per edge node
-                key = (edge_id, core_id)
-                if key in task.edge_execution_times:
-                    edge_time = task.edge_execution_times[key]
+                key = (task.id, edge_id, core_id)
+                if key in edge_execution_times:
+                    edge_time = edge_execution_times[key]
                     if edge_time < t_edge_min:
                         t_edge_min = edge_time
                         best_edge_id = edge_id
@@ -2887,29 +2876,27 @@ def primary_assignment(tasks, edge_nodes=None):
 
         # Use the true (unadjusted) cloud time
         t_re = sum(task.cloud_execution_times) if task.cloud_execution_times else float('inf')
-        # Print for debugging
-        print(f"Task {task.id}: Device={t_l_min}, Edge={t_edge_min}, Cloud={t_re}")
 
-        # Choose the execution tier based solely on the three raw times
-        if t_l_min <= t_edge_min and t_l_min <= t_re:
+        # Data-intensive check (odd task IDs in our model)
+        is_data_intensive = task.id % 2 == 1
+
+        # Consider data size as a factor for edge preference
+        if is_data_intensive and t_edge_min < t_l_min * 1.1:  # Allow edge to be slightly slower
+            task.execution_tier = ExecutionTier.EDGE
+            task.edge_assignment = EdgeAssignment(edge_id=best_edge_id, core_id=best_core_id)
+            logger.info(
+                f"Task {task.id}: Device={t_l_min:.2f}, Edge={t_edge_min:.2f}, Cloud={t_re:.2f} → EDGE (data-intensive)")
+        # Choose strictly fastest option for other tasks
+        elif t_l_min <= t_edge_min and t_l_min <= t_re:
             task.execution_tier = ExecutionTier.DEVICE
+            logger.info(f"Task {task.id}: Device={t_l_min:.2f}, Edge={t_edge_min:.2f}, Cloud={t_re:.2f} → DEVICE")
         elif t_edge_min <= t_l_min and t_edge_min <= t_re:
             task.execution_tier = ExecutionTier.EDGE
             task.edge_assignment = EdgeAssignment(edge_id=best_edge_id, core_id=best_core_id)
+            logger.info(f"Task {task.id}: Device={t_l_min:.2f}, Edge={t_edge_min:.2f}, Cloud={t_re:.2f} → EDGE")
         else:
             task.execution_tier = ExecutionTier.CLOUD
-
-        if task.execution_tier == ExecutionTier.CLOUD:
-            logger.info(f"Initializing cloud task {task.id}")
-            # Use the task's cloud_execution_times as-is (no bias)
-            task.cloud_execution_times = task.cloud_execution_times or [3, 1, 1]
-            # Instead of fixed values, immediately update cloud timing based on predecessors
-            update_cloud_timing(task, tasks)
-            # Clear other tier assignments
-            task.device_core = -1
-            task.edge_assignment = None
-            task.FT_l = 0
-    return
+            logger.info(f"Task {task.id}: Device={t_l_min:.2f}, Edge={t_edge_min:.2f}, Cloud={t_re:.2f} → CLOUD")
 
 
 def task_prioritizing(tasks):
@@ -4239,7 +4226,6 @@ def optimize_task_scheduling_three_tier(
 
         # Apply the selected migration
         task_id = best_migration.task_id
-        task_idx = task_id - 1  # Convert to 0-based index
 
         # Get target execution unit
         if best_migration.target_tier == ExecutionTier.DEVICE:
@@ -4897,17 +4883,37 @@ def identify_optimal_migration_three_tier(migration_trials_results: List[Tuple],
                                           current_energy: float,
                                           max_time: float,
                                           priority_energy_reduction: bool = True) -> Optional[TaskMigrationState]:
+    """
+    Identifies optimal task migration with preference for edge execution when sensible.
+
+    Args:
+        migration_trials_results: List of (task_idx, target_unit_index, migration_time, migration_energy) tuples
+        current_time: Current total completion time
+        current_energy: Current total energy consumption
+        max_time: Maximum allowable completion time
+        priority_energy_reduction: Whether to prioritize energy reduction over other factors
+
+    Returns:
+        TaskMigrationState for the optimal migration, or None if no valid migration found
+    """
     logger.info(f"Evaluating {len(migration_trials_results)} possible migrations")
     allowed_time_increase = current_time * 0.5  # Allow 50% time increase
 
+    # Step 1: Filter and prepare candidate migrations
     candidate_migrations = []
     for task_idx, target_unit_index, migration_time, migration_energy in migration_trials_results:
+        # Skip invalid migrations
         if migration_time == float('inf') or migration_energy == float('inf'):
             continue
+
         task_id = task_idx + 1
         energy_reduction = current_energy - migration_energy
         time_increase = migration_time - current_time
+        time_improvement = current_time - migration_time
+
+        # Only consider migrations that reduce energy and don't exceed time constraints
         if energy_reduction > 0 and time_increase <= allowed_time_increase:
+            # Get source and target execution units
             source_unit = get_current_execution_unit(tasks[task_idx])
             target_unit = get_execution_unit_from_index(
                 target_unit_index,
@@ -4915,28 +4921,183 @@ def identify_optimal_migration_three_tier(migration_trials_results: List[Tuple],
                 globals().get('num_edge_nodes', 2),
                 globals().get('num_edge_cores_per_node', 2)
             )
-            candidate_migrations.append((task_id, energy_reduction, time_increase,
-                                         migration_time, migration_energy,
-                                         target_unit_index, source_unit, target_unit))
-    # Sort candidates by energy reduction (highest first)
-    candidate_migrations.sort(key=lambda x: x[1], reverse=True)
-    if candidate_migrations:
-        best = candidate_migrations[0]
-        logger.info(f"Selected migration: Task {best[0]} with energy reduction {best[1]:.2f}")
-        return TaskMigrationState(
-            time=best[3],
-            energy=best[4],
-            efficiency=best[1] / max(0.1, best[2]),
-            task_id=best[0],
-            source_tier=best[6].tier,
-            target_tier=best[7].tier,
-            source_location=best[6].location,
-            target_location=best[7].location,
-            energy_reduction=best[1],
-            time_increase=best[2]
-        )
-    logger.info("No suitable migration found")
-    return None
+
+            # Calculate edge preference score
+            edge_preference = 0.0
+            if target_unit.tier == ExecutionTier.EDGE:
+                # Retrieve the task object
+                task = tasks[task_idx] if task_idx < len(tasks) else None
+
+                if task:
+                    # Factor 1: Task computation profile
+                    if hasattr(task, 'local_execution_times') and task.local_execution_times:
+                        avg_local_time = sum(task.local_execution_times) / len(task.local_execution_times)
+                        # Medium computation tasks (3-8 time units) are good edge candidates
+                        if 3 <= avg_local_time <= 8:
+                            edge_preference += 0.2
+
+                    # Factor 2: Data transfer profile
+                    if hasattr(task, 'data_sizes'):
+                        # Tasks with higher input than output data are good edge candidates
+                        edge_id = target_unit.location[0] + 1  # Convert to 1-based
+                        input_key = f'device_to_edge{edge_id}'
+                        output_key = f'edge{edge_id}_to_device'
+
+                        input_size = task.data_sizes.get(input_key, 0)
+                        output_size = task.data_sizes.get(output_key, 0)
+
+                        if input_size > 0 and output_size > 0:
+                            if input_size > output_size:
+                                edge_preference += 0.15
+                            # Especially good when input is much larger than output
+                            if input_size > output_size * 2:
+                                edge_preference += 0.15
+
+                    # Factor 3: Dependency locality
+                    if hasattr(task, 'pred_tasks'):
+                        edge_predecessors = 0
+                        for pred in task.pred_tasks:
+                            if (hasattr(pred, 'execution_tier') and
+                                    pred.execution_tier == ExecutionTier.EDGE and
+                                    hasattr(pred, 'edge_assignment') and
+                                    pred.edge_assignment):
+                                # Especially valuable if predecessor is on same edge node
+                                if pred.edge_assignment.edge_id == edge_id:
+                                    edge_predecessors += 2
+                                else:
+                                    edge_predecessors += 1
+
+                        edge_preference += min(0.3, 0.1 * edge_predecessors)
+
+                    # Factor 4: Successor locality
+                    if hasattr(task, 'succ_tasks'):
+                        candidates_for_edge = 0
+                        for succ in task.succ_tasks:
+                            # Successors with similar characteristics to this task
+                            # are potential edge candidates
+                            if hasattr(succ, 'local_execution_times') and succ.local_execution_times:
+                                avg_succ_time = sum(succ.local_execution_times) / len(succ.local_execution_times)
+                                if 3 <= avg_succ_time <= 8:
+                                    candidates_for_edge += 1
+
+                        edge_preference += min(0.2, 0.05 * candidates_for_edge)
+
+            # Add to candidates with edge preference factored in
+            candidate_migrations.append({
+                'task_id': task_id,
+                'energy_reduction': energy_reduction,
+                'time_increase': time_increase,
+                'time_improvement': time_improvement,
+                'migration_time': migration_time,
+                'migration_energy': migration_energy,
+                'target_unit_index': target_unit_index,
+                'source_unit': source_unit,
+                'target_unit': target_unit,
+                'edge_preference': edge_preference
+            })
+
+    # Step 2: Decide on sorting strategy
+    if not candidate_migrations:
+        logger.info("No suitable migration found")
+        return None
+
+    # Step 3: Create combined scoring for candidates
+    for candidate in candidate_migrations:
+        # Base score is energy reduction
+        base_score = candidate['energy_reduction']
+
+        # Add edge preference as a percentage boost (up to 10%)
+        # This makes edge slightly preferred when energy savings are close
+        edge_bonus = base_score * candidate['edge_preference'] * 0.1
+
+        # Add time improvement as a small bonus (up to 5%)
+        time_bonus = 0
+        if candidate['time_improvement'] > 0:
+            time_bonus = base_score * min(0.05, candidate['time_improvement'] / current_time)
+
+        # Calculate final score
+        candidate['score'] = base_score + edge_bonus + time_bonus
+
+    # Sort candidates by score (highest first)
+    candidate_migrations.sort(key=lambda x: x['score'], reverse=True)
+
+    # Step 4: Select and return the best migration
+    best = candidate_migrations[0]
+
+    # Log selection details
+    if best['target_unit'].tier == ExecutionTier.EDGE:
+        edge_id, core_id = best['target_unit'].location
+        logger.info(f"Selected migration: Task {best['task_id']} to EDGE (node {edge_id + 1}, core {core_id + 1}) "
+                    f"with energy reduction {best['energy_reduction']:.2f} "
+                    f"(edge preference: {best['edge_preference']:.2f})")
+    else:
+        logger.info(f"Selected migration: Task {best['task_id']} to {best['target_unit'].tier.name} "
+                    f"with energy reduction {best['energy_reduction']:.2f}")
+
+    # Create and return the migration state
+    return TaskMigrationState(
+        time=best['migration_time'],
+        energy=best['migration_energy'],
+        efficiency=best['energy_reduction'] / max(0.1, best['time_increase']),
+        task_id=best['task_id'],
+        source_tier=best['source_unit'].tier,
+        target_tier=best['target_unit'].tier,
+        source_location=best['source_unit'].location,
+        target_location=best['target_unit'].location,
+        energy_reduction=best['energy_reduction'],
+        time_increase=best['time_increase']
+    )
+
+
+def initialize_edge_execution_times():
+    """Create reasonable edge execution times for all tasks"""
+    global edge_execution_times
+
+    # Clear existing dictionary if it exists
+    if 'edge_execution_times' in globals():
+        edge_execution_times.clear()
+    else:
+        edge_execution_times = {}
+
+    for task_id in range(1, 11):  # For tasks 1-10 in our sample
+        # Get local execution times for this task
+        local_times = core_execution_times.get(task_id, [9, 7, 5])
+        min_local = min(local_times)
+        avg_local = sum(local_times) / len(local_times)
+
+        # Cloud time for comparison
+        cloud_time = sum(cloud_execution_times)
+
+        # Different edge performance profiles for different task types
+        for edge_id in range(1, 3):  # Two edge nodes
+            for core_id in range(1, 3):  # Two cores per edge
+                # Data intensive tasks (odd IDs in our example) - edge performs well
+                if task_id % 2 == 1:
+                    # Edge slightly better than best local core
+                    edge_time = min_local * 0.9
+                # Compute intensive tasks (even IDs) - cloud might perform better
+                else:
+                    # Edge between local and cloud performance
+                    edge_time = (min_local + cloud_time) / 2
+
+                # Add variability between edge nodes and cores
+                if edge_id == 2:
+                    edge_time *= 1.1  # Second edge node slightly slower
+                if core_id == 2:
+                    edge_time *= 1.05  # Second core slightly slower
+
+                # Store the edge execution time
+                edge_execution_times[(task_id, edge_id, core_id)] = edge_time
+
+                # Also update each task object directly for redundancy
+                task = next((t for t in tasks if t.id == task_id), None)
+                if task:
+                    if not hasattr(task, 'edge_execution_times'):
+                        task.edge_execution_times = {}
+                    task.edge_execution_times[(edge_id, core_id)] = edge_time
+
+    logger.info(f"Initialized edge execution times for {len(edge_execution_times) // 4} tasks")
+    return edge_execution_times
 
 
 def get_execution_unit_from_index(index: int, num_device_cores: int,
@@ -5292,19 +5453,38 @@ def encode_task_assignment(task: Any) -> Tuple:
             return (2,)  # (CLOUD,)
 
 
+def calculate_edge_suitability(task, upload_rates, download_rates):
+    """Calculate a score indicating how suitable a task is for edge execution"""
+    suitability = 0.0
+
+    # 1. Tasks with medium computation requirements benefit from edge
+    avg_device_time = sum(task.local_execution_times) / len(task.local_execution_times)
+    if 3 <= avg_device_time <= 8:
+        suitability += 0.5
+
+    # 2. Tasks with high device-to-edge data transfer ratio (more input than output)
+    if task.id in task_data_sizes:
+        input_size = task_data_sizes[task.id].get('device_to_edge1', 0)
+        output_size = task_data_sizes[task.id].get('edge1_to_device', 0)
+        if input_size > 0 and 0 < output_size < input_size:
+            suitability += 0.3
+
+    # 3. Tasks with predecessors on the edge benefit from edge execution
+    edge_predecessors = sum(1 for p in task.pred_tasks if
+                            hasattr(p, 'execution_tier') and
+                            p.execution_tier == ExecutionTier.EDGE)
+    if edge_predecessors > 0:
+        suitability += 0.2 * edge_predecessors
+
+    return suitability
+
+
 def calculate_energy_consumption_three_tier(task: Any,
                                             device_core_powers: Dict[int, float] = None,
                                             edge_node_powers: Dict[Tuple[int, int], float] = None,
                                             rf_power: Dict[str, float] = None,
                                             upload_rates: Dict[str, float] = None,
                                             download_rates: Dict[str, float] = None) -> float:
-    if device_core_powers is None:
-        device_core_powers = {0: 30.0, 1: 40.0, 2: 50.0}
-    if edge_node_powers is None:
-        edge_node_powers = {(1, 1): 0.5, (1, 2): 0.6, (2, 1): 0.4, (2, 2): 0.5}
-    if rf_power is None:
-        rf_power = {'device_to_cloud': 0.05, 'edge1_to_cloud': 0.05, 'edge2_to_cloud': 0.05}
-
     if hasattr(task, 'execution_tier'):
         execution_tier = task.execution_tier
     else:
@@ -5336,6 +5516,26 @@ def calculate_energy_consumption_three_tier(task: Any,
     return 0.0
 
 
+def update_data_sizes():
+    """Update data sizes to create edge-favorable conditions for certain tasks"""
+    for task_id in range(1, 11):
+        if task_id not in task_data_sizes:
+            continue
+
+        # For data-intensive tasks (e.g., 1, 3, 5, 7, 9)
+        if task_id % 2 == 1:
+            # Increase cloud data transfer needs
+            task_data_sizes[task_id]['device_to_cloud'] *= 1.5
+            task_data_sizes[task_id]['cloud_to_device'] *= 1.5
+
+            # Reduce edge data transfer needs
+            task_data_sizes[task_id]['device_to_edge1'] *= 0.8
+            task_data_sizes[task_id]['device_to_edge2'] *= 0.8
+            task_data_sizes[task_id]['edge1_to_device'] *= 0.7
+            task_data_sizes[task_id]['edge2_to_device'] *= 0.7
+    return task_data_sizes
+
+
 if __name__ == '__main__':
     # Create a sample task graph similar to the original framework.
     # Tasks 1–10 with various predecessor–successor relationships.
@@ -5363,6 +5563,57 @@ if __name__ == '__main__':
     task1.pred_tasks = []
 
     tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10]
+
+    # Initialize before primary assignment
+    edge_execution_times = initialize_edge_execution_times()
+    task_data_sizes = update_data_sizes()
+
+    # Ensure each task has edge_execution_times attribute
+    for task in tasks:
+        if not hasattr(task, 'edge_execution_times'):
+            task.edge_execution_times = {}
+            # Add direct access to global edge execution times
+            for edge_id in range(1, 3):
+                for core_id in range(1, 3):
+                    key = (task.id, edge_id, core_id)
+                    if key in edge_execution_times:
+                        task.edge_execution_times[(edge_id, core_id)] = edge_execution_times[key]
+
+    device_core_powers = {0: 30.0, 1: 40.0, 2: 50.0}  # High power consumption for device cores
+
+    # Make edge cores more energy efficient than device cores but less than cloud
+    edge_node_powers = {
+        (1, 1): 15.0, (1, 2): 18.0,  # First edge node cores
+        (2, 1): 12.0, (2, 2): 14.0  # Second edge node cores (slightly more efficient)
+    }
+
+    # Communication energy costs
+    rf_power = {
+        'device_to_cloud': 0.5,  # High power for long-distance transmission
+        'device_to_edge1': 0.2,  # Lower power for shorter distance
+        'device_to_edge2': 0.25,
+        'edge1_to_cloud': 0.3,  # Edge-to-cloud more efficient than device-to-cloud
+        'edge2_to_cloud': 0.35,
+        'edge1_to_device': 0.15,  # Return data even more efficient
+        'edge2_to_device': 0.18
+    }
+
+    # Update upload and download rates
+    upload_rates = {
+        'device_to_edge1': 4.0,  # Much faster than device-to-cloud
+        'device_to_edge2': 3.8,
+        'device_to_cloud': 1.5,  # Keep cloud upload rate lower
+        'edge1_to_cloud': 5.0,  # Edge has better connection to cloud
+        'edge2_to_cloud': 4.8
+    }
+
+    download_rates = {
+        'cloud_to_device': 2.0,
+        'cloud_to_edge1': 4.5,
+        'cloud_to_edge2': 4.2,
+        'edge1_to_device': 6.0,  # Very fast downloads from edge to device
+        'edge2_to_device': 5.8  # Highlights proximity advantage
+    }
 
     # Print task graph summary
     print("Task Graph:")
@@ -5394,31 +5645,6 @@ if __name__ == '__main__':
     T_initial = total_time(tasks)
 
     # Define power and rate dictionaries for energy calculations.
-    device_core_powers = {0: 30.0, 1: 40.0, 2: 50.0}
-    edge_node_powers = {(1, 1): 0.5, (1, 2): 0.6, (2, 1): 0.4, (2, 2): 0.5}
-    rf_power = {
-        'device_to_cloud': 0.05,
-        'edge1_to_cloud': 0.05,
-        'edge2_to_cloud': 0.05,
-        'device_to_edge1': 0.4,
-        'device_to_edge2': 0.45,
-        'edge1_to_device': 0.3,
-        'edge2_to_device': 0.35
-    }
-    upload_rates = {
-        'device_to_edge1': 2.0,
-        'device_to_edge2': 1.8,
-        'device_to_cloud': 1.5,
-        'edge1_to_cloud': 4.0,
-        'edge2_to_cloud': 3.8
-    }
-    download_rates = {
-        'cloud_to_device': 2.0,
-        'cloud_to_edge1': 4.5,
-        'cloud_to_edge2': 4.2,
-        'edge1_to_device': 3.0,
-        'edge2_to_device': 2.8
-    }
 
     E_initial = total_energy_consumption_three_tier(
         tasks, device_core_powers, edge_node_powers, rf_power, upload_rates, download_rates
