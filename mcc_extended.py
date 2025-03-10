@@ -2844,6 +2844,208 @@ def validate_task_dependencies(tasks, epsilon=1e-9):
     is_valid = (len(violations) == 0)
     return is_valid, violations
 
+
+def plot_three_tier_gantt(tasks, scheduler, title="Three-Tier Schedule"):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import numpy as np
+
+    # Get basic dimensions from scheduler
+    num_device_cores = scheduler.k
+    num_edge_nodes = scheduler.M
+    num_edge_cores_per_node = scheduler.edge_cores
+
+    # Create figure and axis
+    fig, ax = plt.subplots(figsize=(15, 10))
+
+    # Map task IDs to task objects for easy lookup
+    task_map = {t.id: t for t in tasks}
+
+    # Define colors for different execution units and operations
+    colors = {
+        'device': 'lightcoral',
+        'edge': 'lightgreen',
+        'cloud_send': 'lightskyblue',
+        'cloud_compute': 'royalblue',
+        'cloud_receive': 'mediumslateblue',
+        'edge_to_device': 'palegreen',  # Transfer from edge to device
+    }
+
+    # Helper function to add centered text to bars
+    def add_centered_text(ax, start, duration, y_level, task_id):
+        center_x = start + duration / 2
+
+        # Pre-measure text to see if it fits in the bar
+        renderer = ax.figure.canvas.get_renderer()
+        text_obj = ax.text(0, 0, f"T{task_id}", fontsize=10, fontweight='bold')
+        bbox = text_obj.get_window_extent(renderer=renderer)
+        text_obj.remove()
+
+        trans = ax.transData.inverted()
+        text_width = trans.transform((bbox.width, 0))[0] - trans.transform((0, 0))[0]
+
+        if text_width > duration * 0.8:
+            # Text won't fit inside bar, so place it above
+            ax.text(center_x, y_level + 0.3, f"T{task_id}",
+                    va='bottom', ha='center',
+                    color='black', fontsize=10, fontweight='bold',
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=1))
+        else:
+            # Text fits inside bar
+            ax.text(center_x, y_level, f"T{task_id}",
+                    va='center', ha='center',
+                    color='black', fontsize=10, fontweight='bold')
+
+    # Calculate maximum completion time across all tasks
+    max_completion_time = max(t.execution_finish_time for t in tasks)
+
+    # Prepare y-positions for each resource
+    yticks = []
+    ytick_labels = []
+
+    # Position counter (from bottom to top)
+    y_pos = 0
+    y_positions = {}
+
+    # Cloud positions (bottom of chart)
+    y_positions['cloud_send'] = y_pos
+    yticks.append(y_pos)
+    ytick_labels.append('Cloud Upload')
+    y_pos += 1
+
+    y_positions['cloud_compute'] = y_pos
+    yticks.append(y_pos)
+    ytick_labels.append('Cloud Compute')
+    y_pos += 1
+
+    y_positions['cloud_receive'] = y_pos
+    yticks.append(y_pos)
+    ytick_labels.append('Cloud Download')
+    y_pos += 1
+
+    # Edge transfer channels
+    for e_id in range(num_edge_nodes):
+        y_positions[f'edge{e_id}_to_device'] = y_pos
+        yticks.append(y_pos)
+        ytick_labels.append(f'Edge {e_id + 1} → Device')
+        y_pos += 1
+
+    # Edge node cores
+    for e_id in range(num_edge_nodes):
+        for c_id in range(num_edge_cores_per_node):
+            y_positions[f'edge{e_id}_core{c_id}'] = y_pos
+            yticks.append(y_pos)
+            ytick_labels.append(f'Edge {e_id + 1} Core {c_id + 1}')
+            y_pos += 1
+
+    # Device cores
+    for core_id in range(num_device_cores):
+        y_positions[f'device_core{core_id}'] = y_pos
+        yticks.append(y_pos)
+        ytick_labels.append(f'Device Core {core_id + 1}')
+        y_pos += 1
+
+    # Plot tasks on device cores
+    for task in tasks:
+        if task.execution_tier == ExecutionTier.DEVICE:
+            core_id = task.device_core
+            y_level = y_positions[f'device_core{core_id}']
+
+            if hasattr(task, 'execution_unit_task_start_times') and task.execution_unit_task_start_times:
+                start_time = task.execution_unit_task_start_times[core_id]
+                duration = task.FT_l - start_time
+
+                ax.barh(y_level, duration, left=start_time, height=0.6,
+                        align='center', color=colors['device'], edgecolor='black')
+                add_centered_text(ax, start_time, duration, y_level, task.id)
+
+    # Plot tasks on edge nodes
+    for task in tasks:
+        if task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+            e_id = task.edge_assignment.edge_id - 1  # Convert to 0-based
+            c_id = task.edge_assignment.core_id - 1  # Convert to 0-based
+            y_level = y_positions[f'edge{e_id}_core{c_id}']
+
+            # Edge execution
+            if hasattr(task, 'execution_unit_task_start_times') and task.execution_unit_task_start_times:
+                seq_idx = scheduler.get_edge_core_index(e_id, c_id)
+                if seq_idx < len(task.execution_unit_task_start_times):
+                    start_time = task.execution_unit_task_start_times[seq_idx]
+                    if e_id in task.FT_edge:
+                        finish_time = task.FT_edge[e_id]
+                        duration = finish_time - start_time
+
+                        ax.barh(y_level, duration, left=start_time, height=0.6,
+                                align='center', color=colors['edge'], edgecolor='black')
+                        add_centered_text(ax, start_time, duration, y_level, task.id)
+
+            # Edge-to-device transfer
+            if hasattr(task, 'FT_edge') and hasattr(task, 'FT_edge_receive'):
+                if e_id in task.FT_edge and e_id in task.FT_edge_receive:
+                    start_time = task.FT_edge[e_id]
+                    finish_time = task.FT_edge_receive[e_id]
+                    duration = finish_time - start_time
+
+                    y_level = y_positions[f'edge{e_id}_to_device']
+                    ax.barh(y_level, duration, left=start_time, height=0.6,
+                            align='center', color=colors['edge_to_device'], edgecolor='black', hatch='///')
+                    add_centered_text(ax, start_time, duration, y_level, task.id)
+
+    # Plot tasks on cloud
+    for task in tasks:
+        if task.execution_tier == ExecutionTier.CLOUD:
+            # Cloud sending phase
+            send_start = task.RT_ws
+            send_duration = task.FT_ws - task.RT_ws
+            y_level = y_positions['cloud_send']
+            ax.barh(y_level, send_duration, left=send_start, height=0.6,
+                    align='center', color=colors['cloud_send'], edgecolor='black')
+            add_centered_text(ax, send_start, send_duration, y_level, task.id)
+
+            # Cloud computing phase
+            compute_start = task.RT_c
+            compute_duration = task.FT_c - task.RT_c
+            y_level = y_positions['cloud_compute']
+            ax.barh(y_level, compute_duration, left=compute_start, height=0.6,
+                    align='center', color=colors['cloud_compute'], edgecolor='black')
+            add_centered_text(ax, compute_start, compute_duration, y_level, task.id)
+
+            # Cloud receiving phase
+            receive_start = task.RT_wr
+            receive_duration = task.FT_wr - task.RT_wr
+            y_level = y_positions['cloud_receive']
+            ax.barh(y_level, receive_duration, left=receive_start, height=0.6,
+                    align='center', color=colors['cloud_receive'], edgecolor='black')
+            add_centered_text(ax, receive_start, receive_duration, y_level, task.id)
+
+    # Configure axis
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ytick_labels)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Execution Resource")
+    ax.set_title(title)
+    ax.grid(True, axis='x', linestyle='--', alpha=0.7)
+    ax.set_xlim(0, max_completion_time * 1.05)
+
+    # Create legend
+    legend_elements = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors['device'], edgecolor='black', label='Device Execution'),
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors['edge'], edgecolor='black', label='Edge Execution'),
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors['cloud_send'], edgecolor='black', label='Cloud Upload'),
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors['cloud_compute'], edgecolor='black', label='Cloud Computation'),
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors['cloud_receive'], edgecolor='black', label='Cloud Download'),
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors['edge_to_device'], edgecolor='black', hatch='///',
+                      label='Edge→Device Transfer')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right')
+
+    # Draw vertical lines for key time points to make it easier to track dependencies
+    for time_point in range(int(max_completion_time) + 1):
+        ax.axvline(x=time_point, color='gray', linestyle=':', alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
 ####################################
 # SECTION: MAIN PROGRAM EXECUTION
 ####################################
@@ -2860,28 +3062,49 @@ if __name__ == "__main__":
     # initialize_edge_execution_times()
 
     # 3) Build or define your DAG tasks
-    task10 = Task(10)
-    task9 = Task(9, succ_task=[task10])
-    task8 = Task(8, succ_task=[task10])
-    task7 = Task(7, succ_task=[task10])
-    task6 = Task(6, succ_task=[task8])
-    task5 = Task(5, succ_task=[task9])
-    task4 = Task(4, succ_task=[task8, task9])
-    task3 = Task(3, succ_task=[task7])
-    task2 = Task(2, succ_task=[task8, task9])
-    task1 = Task(1, succ_task=[task2, task3, task4, task5, task6])
-    task10.pred_tasks = [task7, task8, task9]
-    task9.pred_tasks = [task2, task4, task5]
-    task8.pred_tasks = [task2, task4, task6]
-    task7.pred_tasks = [task3]
-    task6.pred_tasks = [task1]
-    task5.pred_tasks = [task1]
-    task4.pred_tasks = [task1]
-    task3.pred_tasks = [task1]
-    task2.pred_tasks = [task1]
+    task20 = Task(id=20, succ_task=[])
+    task19 = Task(id=19, succ_task=[])
+    task18 = Task(id=18, succ_task=[])
+    task17 = Task(id=17, succ_task=[])
+    task16 = Task(id=16, succ_task=[task19])
+    task15 = Task(id=15, succ_task=[task19])
+    task14 = Task(id=14, succ_task=[task18, task19])
+    task13 = Task(id=13, succ_task=[task17, task18])
+    task12 = Task(id=12, succ_task=[task17])
+    task11 = Task(id=11, succ_task=[task15, task16])
+    task10 = Task(id=10, succ_task=[task11, task15])
+    task9 = Task(id=9, succ_task=[task13, task14])
+    task8 = Task(id=8, succ_task=[task12, task13])
+    task7 = Task(id=7, succ_task=[task12])
+    task6 = Task(id=6, succ_task=[task10, task11])
+    task5 = Task(id=5, succ_task=[task9, task10])
+    task4 = Task(id=4, succ_task=[task8, task9])
+    task3 = Task(id=3, succ_task=[task7, task8])
+    task2 = Task(id=2, succ_task=[task7, task8])
+    task1 = Task(id=1, succ_task=[task7])
     task1.pred_tasks = []
+    task2.pred_tasks = []
+    task3.pred_tasks = []
+    task4.pred_tasks = []
+    task5.pred_tasks = []
+    task6.pred_tasks = []
+    task7.pred_tasks = [task1, task2, task3]
+    task8.pred_tasks = [task3, task4]
+    task9.pred_tasks = [task4, task5]
+    task10.pred_tasks = [task5, task6]
+    task11.pred_tasks = [task6, task10]
+    task12.pred_tasks = [task7, task8]
+    task13.pred_tasks = [task8, task9]
+    task14.pred_tasks = [task9, task10]
+    task15.pred_tasks = [task10, task11]
+    task16.pred_tasks = [task11]
+    task17.pred_tasks = [task12, task13]
+    task18.pred_tasks = [task13, task14]
+    task19.pred_tasks = [task14, task15, task16]
+    task20.pred_tasks = [task12]
 
-    predefined_tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10]
+    predefined_tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10, task11, task12, task13, task14,
+             task15, task16, task17, task18, task19, task20]
 
     # 4) Enhance tasks with complexity, data sizes, etc.
     tasks = generate_task_graph(predefined_tasks=predefined_tasks)
@@ -2962,3 +3185,4 @@ if __name__ == "__main__":
         print("\nSchedule has DAG/time violations:")
         for v in violations:
             print(f" - {v}")
+    plot_three_tier_gantt(tasks,scheduler)
