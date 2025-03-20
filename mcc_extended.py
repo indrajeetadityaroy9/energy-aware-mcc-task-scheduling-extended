@@ -1401,43 +1401,50 @@ def generate_realistic_network_conditions(time_of_day=None):
 # SECTION: UTILITY FUNCTIONS
 ####################################
 
-def get_execution_unit_from_index(index: int) -> ExecutionUnit:
+# First, define a modified version of get_execution_unit_from_index
+def get_execution_unit_from_index(target_unit_idx, sequence_manager=None):
     """
-    Converts a linear index to an ExecutionUnit using globally available parameters.
+    Converts a linear index to an ExecutionUnit using system configuration.
 
     Args:
-        index: Linear index representing an execution unit
+        target_unit_idx: Linear index representing an execution unit
+        sequence_manager: Optional SequenceManager containing system configuration
 
     Returns:
         ExecutionUnit corresponding to the provided index
     """
-    # Get the structure parameters from globals or use defaults
-    num_device_cores = globals().get('num_device_cores', 3)
-    num_edge_nodes = globals().get('num_edge_nodes', 2)
-    num_edge_cores_per_node = globals().get('num_edge_cores_per_node', 2)
+    # Get system configuration
+    if sequence_manager:
+        num_device_cores = sequence_manager.num_device_cores
+        num_edge_nodes = sequence_manager.num_edge_nodes
+        num_edge_cores_per_node = sequence_manager.num_edge_cores_per_node
+    else:
+        # Default values if sequence_manager not provided
+        num_device_cores = 3  # Default to 3 device cores
+        num_edge_nodes = 2  # Default to 2 edge nodes
+        num_edge_cores_per_node = 2  # Default to 2 cores per edge node
 
-    # Device cores
-    if index < num_device_cores:
-        return ExecutionUnit(ExecutionTier.DEVICE, (index,))
+    # Check if index is for a device core
+    if target_unit_idx < num_device_cores:
+        return ExecutionUnit(ExecutionTier.DEVICE, (target_unit_idx,))
 
-    # Edge cores
+    # Check if index is for an edge core
     edge_offset = num_device_cores
     total_edge_cores = num_edge_nodes * num_edge_cores_per_node
 
-    if index < edge_offset + total_edge_cores:
-        edge_index = index - edge_offset
+    if target_unit_idx < edge_offset + total_edge_cores:
+        edge_index = target_unit_idx - edge_offset
         node_id = edge_index // num_edge_cores_per_node
         core_id = edge_index % num_edge_cores_per_node
         return ExecutionUnit(ExecutionTier.EDGE, (node_id, core_id))
 
-    # Cloud
+    # Must be cloud
     return ExecutionUnit(ExecutionTier.CLOUD)
 
 
-def get_current_execution_unit(task: Any) -> ExecutionUnit:
+def get_current_execution_unit(task):
     """
-    Get the current execution unit for a task.
-    Works with both three-tier tasks and original MCC tasks.
+    Gets the current execution unit for a task.
 
     Args:
         task: Task object
@@ -1445,50 +1452,56 @@ def get_current_execution_unit(task: Any) -> ExecutionUnit:
     Returns:
         ExecutionUnit where the task is currently scheduled
     """
-    if hasattr(task, 'execution_tier'):
-        # Three-tier task
-        tier = task.execution_tier
-
-        if tier == ExecutionTier.DEVICE:
-            return ExecutionUnit(tier, (task.device_core,))
-        elif tier == ExecutionTier.EDGE and task.edge_assignment:
-            return ExecutionUnit(tier, (
-                task.edge_assignment.edge_id - 1,  # Convert to 0-based
-                task.edge_assignment.core_id - 1  # Convert to 0-based
-            ))
-        else:
-            return ExecutionUnit(ExecutionTier.CLOUD)
-    else:
-        # Original MCC task
-        if hasattr(task, 'is_core_task') and task.is_core_task:
-            return ExecutionUnit(ExecutionTier.DEVICE, (task.assignment,))
-        else:
-            return ExecutionUnit(ExecutionTier.CLOUD)
+    if task.execution_tier == ExecutionTier.DEVICE:
+        return ExecutionUnit(ExecutionTier.DEVICE, (task.device_core,))
+    elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+        return ExecutionUnit(ExecutionTier.EDGE, (
+            task.edge_assignment.edge_id - 1,  # Convert to 0-based
+            task.edge_assignment.core_id - 1  # Convert to 0-based
+        ))
+    else:  # Cloud
+        return ExecutionUnit(ExecutionTier.CLOUD)
 
 
-def generate_migration_cache_key(tasks: List[Any], task_id: int, source_unit: ExecutionUnit,
-                                 target_unit: ExecutionUnit) -> Tuple:
+def generate_migration_cache_key(tasks, task_idx, source_unit, target_unit):
     """
-    Generate a cache key for a specific migration.
+    Generate a unique cache key for a migration scenario.
 
     Args:
         tasks: List of all tasks
-        task_id: ID of task being migrated
-        source_unit: Source execution unit
-        target_unit: Target execution unit
+        task_idx: Index of task being migrated
+        source_unit: Source ExecutionUnit
+        target_unit: Target ExecutionUnit
 
     Returns:
-        Tuple that uniquely identifies this migration
+        tuple: Unique identifier for this migration
     """
-    # Encode execution units
-    source_key = encode_execution_unit(source_unit)
-    target_key = encode_execution_unit(target_unit)
+    # Encode task
+    task_key = task_idx
 
-    # Encode current task assignments
-    assignments = tuple(encode_task_assignment(task) for task in tasks)
+    # Encode source unit
+    source_key = (source_unit.tier.value,)
+    if source_unit.tier == ExecutionTier.DEVICE:
+        source_key += (source_unit.location[0],)
+    elif source_unit.tier == ExecutionTier.EDGE:
+        source_key += (source_unit.location[0], source_unit.location[1])
 
-    # Combine everything into a single key
-    return task_id, source_key, target_key, assignments
+    # Encode target unit
+    target_key = (target_unit.tier.value,)
+    if target_unit.tier == ExecutionTier.DEVICE:
+        target_key += (target_unit.location[0],)
+    elif target_unit.tier == ExecutionTier.EDGE:
+        target_key += (target_unit.location[0], target_unit.location[1])
+
+    # Encode current task assignments (can be simplified for performance)
+    # Only include critical information like dependencies
+    assignments = tuple(
+        (t.id, t.execution_tier.value) for t in tasks
+        if t.id in [p.id for p in tasks[task_idx].pred_tasks] or
+        t.id in [s.id for s in tasks[task_idx].succ_tasks]
+    )
+
+    return (task_key, source_key, target_key, assignments)
 
 
 def encode_execution_unit(unit: ExecutionUnit) -> Tuple:
@@ -2027,18 +2040,47 @@ class ThreeTierTaskScheduler:
 
 def total_time_3tier(tasks):
     """
-    Returns the overall application completion time for the three-tier system
-    by analogy to Equation (10) in the original MCC paper.
+    Returns the overall application completion time for the three-tier system.
 
-    We assume each task has .execution_finish_time set after scheduling.
+    Args:
+        tasks: List of all tasks in the application
+
+    Returns:
+        float: Maximum finish time among exit tasks
     """
-    # Identify exit tasks: tasks with no successors
+    # Identify exit tasks (tasks with no successors)
     exit_tasks = [t for t in tasks if not t.succ_tasks]
-    if not exit_tasks:
-        return 0.0  # If your DAG has no explicit exit tasks, fallback
 
-    # Each task in your code has .execution_finish_time after scheduling
-    return max(t.execution_finish_time for t in exit_tasks)
+    if not exit_tasks:
+        logger.warning("No exit tasks found in task graph")
+        # Fallback: use maximum finish time among all tasks
+        return max(task.execution_finish_time for task in tasks
+                   if hasattr(task, 'execution_finish_time'))
+
+    # Find maximum finish time among exit tasks
+    max_finish_time = 0.0
+
+    for task in exit_tasks:
+        finish_time = 0.0
+
+        # Get finish time based on execution tier
+        if task.execution_tier == ExecutionTier.DEVICE:
+            finish_time = task.FT_l
+        elif task.execution_tier == ExecutionTier.CLOUD:
+            finish_time = task.FT_wr  # When results are received
+        elif task.execution_tier == ExecutionTier.EDGE:
+            if task.edge_assignment:
+                edge_id = task.edge_assignment.edge_id - 1
+                # Use edge_receive time if available (when results arrive at device)
+                if hasattr(task, 'FT_edge_receive') and edge_id in task.FT_edge_receive:
+                    finish_time = task.FT_edge_receive[edge_id]
+                else:
+                    # Fallback to edge execution finish time
+                    finish_time = task.FT_edge.get(edge_id, 0.0)
+
+        max_finish_time = max(max_finish_time, finish_time)
+
+    return max_finish_time
 
 
 def total_energy_3tier_with_rf(
@@ -2152,361 +2194,1093 @@ def total_energy_3tier_with_rf(
 
     return total_energy
 
-
-def generate_realistic_power_models(device_type='mobile', battery_level=100):
+def optimize_task_scheduling(tasks, sequence_manager, T_final,
+                             power_models, upload_rates, download_rates,
+                             migration_cache=None, max_iterations=100):
     """
-    Generate realistic power consumption models that vary with load.
-
-    Parameters:
-        device_type: Type of device ('mobile', 'edge_server', 'cloud_server')
-        battery_level: Current battery percentage (mobile only)
-
-    Returns:
-        Dictionary of power models for different processing units
-    """
-    # Base power models with load-dependent functions
-    power_models = {
-        'device': {},
-        'edge': {},
-        'cloud': {},
-        'rf': {}
-    }
-
-    # Mobile device power characteristics
-    if device_type == 'mobile':
-        # Battery efficiency drops as battery level decreases
-        battery_factor = 1.0 if battery_level > 30 else 1.0 + (30 - battery_level) * 0.01
-
-        # Different cores have different power profiles
-        # Power = idle_power + (load * dynamic_power * frequency^2)
-        power_models['device'] = {
-            0: {  # High-performance core
-                'idle_power': 0.1 * battery_factor,
-                'dynamic_power': lambda load: (0.2 + 1.8 * load) * battery_factor,
-                'frequency_range': (0.8, 2.4),  # GHz
-                'current_frequency': 2.0,
-                'dvfs_enabled': True
-            },
-            1: {  # Mid-range core
-                'idle_power': 0.05 * battery_factor,
-                'dynamic_power': lambda load: (0.1 + 1.4 * load) * battery_factor,
-                'frequency_range': (0.6, 1.8),
-                'current_frequency': 1.6,
-                'dvfs_enabled': True
-            },
-            2: {  # Efficiency core
-                'idle_power': 0.03 * battery_factor,
-                'dynamic_power': lambda load: (0.05 + 0.95 * load) * battery_factor,
-                'frequency_range': (0.5, 1.5),
-                'current_frequency': 1.2,
-                'dvfs_enabled': True
-            }
-        }
-
-        # RF transmission power varies with signal strength and data rate
-        power_models['rf'] = {
-            'device_to_edge': lambda data_rate, signal_strength:
-            (0.1 + 0.4 * (data_rate / 10) * (1 + (70 - signal_strength) * 0.02)) * battery_factor,
-            'device_to_cloud': lambda data_rate, signal_strength:
-            (0.15 + 0.6 * (data_rate / 5) * (1 + (70 - signal_strength) * 0.03)) * battery_factor,
-        }
-
-    # Edge server power characteristics - more power efficient than mobile, less than cloud
-    elif device_type == 'edge_server':
-        for edge_id in range(1, 3):  # Two edge nodes
-            for core_id in range(1, 3):  # Two cores per node
-                efficiency = 1.0 - 0.1 * (edge_id - 1) - 0.05 * (core_id - 1)  # First edge, first core most efficient
-                power_models['edge'][(edge_id, core_id)] = {
-                    'idle_power': 5.0 * efficiency,
-                    'dynamic_power': lambda load: (3.0 + 12.0 * load) * efficiency,
-                    'frequency_range': (1.0, 3.2),
-                    'current_frequency': 2.8,
-                    'dvfs_enabled': True
-                }
-
-    # Cloud server power characteristics - highest absolute power but most efficient per computation
-    elif device_type == 'cloud_server':
-        power_models['cloud'] = {
-            'idle_power': 50.0,
-            'dynamic_power': lambda load: (20.0 + 180.0 * load),
-            'frequency_range': (2.0, 4.0),
-            'current_frequency': 3.5,
-            'virtualization_overhead': 0.1  # 10% overhead due to virtualization
-        }
-
-    return power_models
-
-
-def format_schedule_3tier(tasks, scheduler):
-    """
-    Builds a formatted table of the scheduled tasks in a three-tier environment.
-    Shows:
-        Task  |  Tier        |  Start Time  |  Finish Time |  Resource
+    Implements the task migration algorithm extended to a three-tier architecture.
+    Optimizes energy consumption while maintaining completion time constraints.
 
     Args:
-        tasks: List of Task objects that have:
-               - execution_tier
-               - device_core
-               - edge_assignment
-               - execution_finish_time
-               - execution_unit_task_start_times
-        scheduler: A reference to the ThreeTierTaskScheduler (or whichever object
-                   provides get_edge_core_index() and get_cloud_index()) so we can
-                   determine the correct index for edge/cloud resources.
+        tasks: List of tasks from application graph G=(V,E)
+        sequence_manager: SequenceManager object with current execution sequences
+        T_final: Target completion time constraint T_max
+        power_models: Power consumption models for device, edge, and RF components
+        upload_rates: Dictionary of upload rates for different connections
+        download_rates: Dictionary of download rates for different connections
+        migration_cache: Optional cache for reusing migration evaluations
+        max_iterations: Maximum number of migration iterations to perform
 
     Returns:
-        A multi-line string containing the formatted schedule table.
+        tuple: (tasks, sequence_manager) with optimized scheduling
     """
+    # Initialize migration cache if not provided
+    if migration_cache is None:
+        migration_cache = MigrationCache(capacity=10000)
 
-    header = f"{'Task':<5}  {'Tier':<10}  {'Start':>7}  {'Finish':>7}  Resource"
-    sep_line = "-" * len(header)
+    # Store system configuration
+    num_device_cores = len(sequence_manager.sequences[:sequence_manager.num_device_cores])
+    num_edge_nodes = sequence_manager.num_edge_nodes
+    num_edge_cores_per_node = sequence_manager.num_edge_cores_per_node
 
-    lines = [header, sep_line]
+    # Calculate initial application completion time and energy consumption
+    current_time = total_time_3tier(tasks)
+    current_energy = total_energy_3tier_with_rf(
+        tasks=tasks,
+        device_power_profiles=power_models['device'],
+        rf_power=power_models['rf'],
+        upload_rates=upload_rates
+    )
 
-    for t in tasks:
-        # Retrieve finish time
-        finish_time = getattr(t, 'execution_finish_time', 0.0)
-        tier_name = (t.execution_tier.name if hasattr(t, 'execution_tier') and t.execution_tier
-                     else "UNASSIGNED")
+    # Initialize optimization metrics
+    metrics = OptimizationMetrics()
+    metrics.start(current_time, current_energy)
 
-        # Default or fallback if we cannot find the correct start
-        start_time = 0.0
-        resource_str = "N/A"
+    # Iterative improvement loop
+    iteration = 0
+    energy_improved = True
 
-        if t.execution_tier == ExecutionTier.DEVICE:
-            # e.g. "Device Core 2"
-            core_id = getattr(t, 'device_core', -1)
-            resource_str = f"Device Core {core_id}"
-            # If we have valid start times array and a valid core index
-            if (t.execution_unit_task_start_times
-                    and 0 <= core_id < len(t.execution_unit_task_start_times)):
-                start_time = t.execution_unit_task_start_times[core_id]
+    while energy_improved and iteration < max_iterations:
+        # Store current metrics for comparison
+        previous_energy = current_energy
 
-        elif t.execution_tier == ExecutionTier.EDGE and t.edge_assignment:
-            # e.g. "Edge(Node=1, Core=2)"
-            e_id = t.edge_assignment.edge_id - 1  # 0-based
-            c_id = t.edge_assignment.core_id - 1  # 0-based
-            resource_str = f"Edge(Node={e_id + 1}, Core={c_id + 1})"
+        # Define time constraint - allow some flexibility
+        T_max = T_final * 1.05  # 5% scheduling flexibility
 
-            # get the sequence index from your scheduler method
-            seq_idx = scheduler.get_edge_core_index(e_id, c_id)
+        # Generate and evaluate all valid migration options
+        migration_candidates = []
 
-            if (t.execution_unit_task_start_times
-                    and 0 <= seq_idx < len(t.execution_unit_task_start_times)):
-                start_time = t.execution_unit_task_start_times[seq_idx]
+        # For each task, evaluate possible migration targets
+        for task_idx, task in enumerate(tasks):
+            current_unit = get_current_execution_unit(task)
 
-        elif t.execution_tier == ExecutionTier.CLOUD:
-            resource_str = "Cloud"
-            # If your code places the cloud start time at cloud_idx
-            cloud_idx = scheduler.get_cloud_index()
-            if (t.execution_unit_task_start_times
-                    and 0 <= cloud_idx < len(t.execution_unit_task_start_times)):
-                start_time = t.execution_unit_task_start_times[cloud_idx]
+            # Evaluate migrations to all possible execution units
+            total_execution_units = (
+                    num_device_cores +  # Device cores
+                    num_edge_nodes * num_edge_cores_per_node +  # Edge cores
+                    1  # Cloud
+            )
 
-        # Build a single row for the table
-        lines.append(
-            f"{t.id:<5}  {tier_name:<10}  {start_time:7.2f}  {finish_time:7.2f}  {resource_str}"
-        )
+            for target_unit_idx in range(total_execution_units):
+                # Skip self-migration (same execution unit)
+                target_unit = get_execution_unit_from_index(target_unit_idx)
+                if current_unit == target_unit:
+                    continue
 
-    return "\n".join(lines)
+                # Perform migration trial
+                trial_time, trial_energy = evaluate_migration(
+                    tasks=tasks,
+                    task_idx=task_idx,
+                    sequence_manager=sequence_manager,
+                    source_unit=current_unit,
+                    target_unit=target_unit,
+                    migration_cache=migration_cache,
+                    power_models=power_models,
+                    upload_rates=upload_rates,
+                    download_rates=download_rates
+                )
 
+                # Store migration candidate if energy reduction is possible
+                if trial_energy < previous_energy:
+                    energy_reduction = previous_energy - trial_energy
+                    time_increase = max(0, trial_time - current_time)
 
-def validate_three_tier_schedule(
-        tasks: List[Any],
-        sequences: List[List[int]],
-        num_device_cores: int = 3,
-        num_edge_nodes: int = 2,
-        num_edge_cores_per_node: int = 2
-) -> Dict[str, Any]:
-    """
-    Validates a three-tier schedule for:
-     - Whether tasks are assigned or left unscheduled
-     - Whether DAG dependency constraints are violated
-     - Whether tasks appear in the resource sequences
-     - Whether tasks are assigned to valid resources
-     - Whether tier-specific fields are consistent
-    Returns a dictionary summarizing validity and any issues.
-    """
+                    # Calculate efficiency ratio (energy reduction per unit time)
+                    if time_increase <= 0:
+                        efficiency = float('inf')  # Prioritize cases with no time increase
+                    else:
+                        efficiency = energy_reduction / time_increase
 
-    validation = {
-        "valid": True,
-        "dependency_violations": 0,
-        "sequence_violations": 0,
-        "resource_violations": 0,
-        "tier_violations": 0,
-        "unscheduled_tasks": 0,
-        "issues": []
-    }
-
-    # ----------------------------------------------------
-    # 1) Check if all tasks are scheduled
-    # ----------------------------------------------------
-    for task in tasks:
-        # We'll see if it's "scheduled" by checking key attributes
-        scheduled = False
-        if hasattr(task, 'execution_tier'):
-            # For your three-tier tasks, we expect one of the three:
-            if task.execution_tier == ExecutionTier.DEVICE:
-                # Must have device_core >= 0
-                if (hasattr(task, 'device_core') and
-                        task.device_core is not None and
-                        task.device_core >= 0):
-                    scheduled = True
-            elif task.execution_tier == ExecutionTier.EDGE:
-                # Must have a valid EdgeAssignment
-                if (hasattr(task, 'edge_assignment') and
-                        task.edge_assignment is not None):
-                    scheduled = True
-            elif task.execution_tier == ExecutionTier.CLOUD:
-                # If it's assigned to the Cloud, we assume "scheduled"
-                scheduled = True
-        else:
-            # Original MCC-like
-            if hasattr(task, 'assignment') and task.assignment >= 0:
-                scheduled = True
-
-        if not scheduled:
-            validation["unscheduled_tasks"] += 1
-            task_id = getattr(task, 'id', '?')
-            validation["issues"].append(f"Task {task_id} has no valid assignment")
-
-    # ----------------------------------------------------
-    # 2) Check DAG dependency constraints
-    # ----------------------------------------------------
-    # We’ll define a small helper to confirm that each child
-    # appears after all its predecessors.
-    # This function might either check scheduling times or just that "predecessors exist".
-    # If you want to do time-based checks, you'd have to gather the actual start/finish times
-    # from the tasks. Otherwise, we do a structural check that you haven't assigned children
-    # with missing or contradictory preds. For brevity, we'll do a structural check here.
-
-    if not validate_task_dependencies(tasks):
-        # If your code has a separate function for that, fine.
-        validation["valid"] = False
-        validation["dependency_violations"] += 1
-        validation["issues"].append("Task dependency constraints are violated")
-
-    # ----------------------------------------------------
-    # 3) Check sequence consistency
-    #    Ensure each task appears 0 or 1 times in your resource sequences
-    # ----------------------------------------------------
-
-    # We’ll see how many tasks exist total
-    task_counts = {}
-    for t in tasks:
-        tid = getattr(t, 'id', None)
-        if tid is not None:
-            task_counts[tid] = task_counts.get(tid, 0) + 1
-
-    # Count how many times each task ID appears in the sequences
-    sequence_task_counts = {}
-    for seq in sequences:
-        for tid in seq:
-            sequence_task_counts[tid] = sequence_task_counts.get(tid, 0) + 1
-
-    # Check for tasks that appear multiple times in the sequences
-    for tid, count in sequence_task_counts.items():
-        if count > 1:
-            validation["sequence_violations"] += 1
-            validation["issues"].append(f"Task {tid} appears in {count} resource sequences")
-
-    # Check for tasks that never appear
-    for tid, count in task_counts.items():
-        if tid not in sequence_task_counts:
-            validation["sequence_violations"] += 1
-            validation["issues"].append(f"Task {tid} is not in any sequence")
-
-    # ----------------------------------------------------
-    # 4) Check resource assignments are valid
-    # ----------------------------------------------------
-    # E.g. device_core must be in [0, num_device_cores-1].
-    # EdgeAssignment must be in [1..num_edge_nodes], [1..num_edge_cores_per_node].
-    for task in tasks:
-        if hasattr(task, 'execution_tier'):
-            if task.execution_tier == ExecutionTier.DEVICE:
-                # Must have 0 <= device_core < num_device_cores
-                if (hasattr(task, 'device_core') and
-                        (task.device_core < 0 or task.device_core >= num_device_cores)):
-                    tid = getattr(task, 'id', '?')
-                    validation["resource_violations"] += 1
-                    validation["issues"].append(
-                        f"Task {tid} assigned to invalid device core {task.device_core}"
+                    migration_candidates.append(
+                        TaskMigrationState(
+                            time=trial_time,
+                            energy=trial_energy,
+                            efficiency=efficiency,
+                            energy_reduction=energy_reduction,
+                            time_increase=time_increase,
+                            task_id=task.id,
+                            source_tier=current_unit.tier,
+                            target_tier=target_unit.tier,
+                            source_location=current_unit.location,
+                            target_location=target_unit.location
+                        )
                     )
 
-            elif task.execution_tier == ExecutionTier.EDGE:
-                if (hasattr(task, 'edge_assignment') and
-                        task.edge_assignment):
-                    edge_id = task.edge_assignment.edge_id
-                    core_id = task.edge_assignment.core_id
-                    # Usually edge_id in [1..M], core_id in [1..num_edge_cores_per_node]
-                    if (edge_id < 1 or edge_id > num_edge_nodes):
-                        validation["resource_violations"] += 1
-                        validation["issues"].append(
-                            f"Task {getattr(task, 'id', '?')} assigned to invalid edge node {edge_id}"
-                        )
-                    if (core_id < 1 or core_id > num_edge_cores_per_node):
-                        validation["resource_violations"] += 1
-                        validation["issues"].append(
-                            f"Task {getattr(task, 'id', '?')} assigned to invalid edge core {core_id}"
-                        )
+        # Sort migration candidates by:
+        # 1. First prioritize those that don't increase completion time
+        # 2. Then by energy reduction (highest first)
+        # 3. If time increases, consider efficiency ratio
+        migration_candidates.sort(
+            key=lambda m: (
+                0 if m.time <= current_time else 1,  # No time increase first
+                -m.energy_reduction,  # Highest energy reduction
+                -m.efficiency  # Highest efficiency ratio
+            )
+        )
 
-            elif task.execution_tier == ExecutionTier.CLOUD:
-                # Typically no specific resource index checks for cloud
-                pass
+        # Select best migration
+        best_migration = None
+        for candidate in migration_candidates:
+            # Skip if it would exceed time constraint
+            if candidate.time > T_max:
+                continue
 
-    # ----------------------------------------------------
-    # 5) Tier consistency checks
-    # ----------------------------------------------------
-    # E.g. if it's a device task, do we have FT_l > 0? If edge, do we see FT_edge? etc.
+            # Accept first valid candidate (already sorted optimally)
+            best_migration = candidate
+            break
+
+        # Exit if no valid migrations remain
+        if best_migration is None:
+            energy_improved = False
+            break
+
+        # Apply selected migration
+        migrated_task = next(t for t in tasks if t.id == best_migration.task_id)
+
+        # 1. Update task's execution tier and location
+        source_unit = ExecutionUnit(
+            tier=best_migration.source_tier,
+            location=best_migration.source_location
+        )
+        target_unit = ExecutionUnit(
+            tier=best_migration.target_tier,
+            location=best_migration.target_location
+        )
+
+        # 2. Construct new sequences using linear-time algorithm
+        sequence_manager = construct_sequence(
+            tasks=tasks,
+            task_id=best_migration.task_id,
+            source_unit=source_unit,
+            target_unit=target_unit,
+            sequence_manager=sequence_manager
+        )
+
+        # 3. Apply kernel algorithm for O(N) rescheduling
+        tasks = kernel_algorithm_3tier(
+            tasks=tasks,
+            sequence_manager=sequence_manager,
+            upload_rates=upload_rates,
+            download_rates=download_rates
+        )
+
+        # Calculate new energy consumption and completion time
+        current_time = total_time_3tier(tasks)
+        current_energy = total_energy_3tier_with_rf(
+            tasks=tasks,
+            device_power_profiles=power_models['device'],
+            rf_power=power_models['rf'],
+            upload_rates=upload_rates
+        )
+
+        # Update metrics
+        metrics.update(current_time, current_energy)
+        energy_improved = current_energy < previous_energy
+        iteration += 1
+
+        # Manage cache size
+        if len(migration_cache.cache) > migration_cache.capacity * 0.9:
+            migration_cache.clear()
+
+    # Log optimization results
+    logger.info(f"Task migration completed: {iteration} iterations")
+    logger.info(f"Initial time: {metrics.initial_time:.2f}, Final time: {metrics.current_time:.2f}")
+    logger.info(f"Initial energy: {metrics.initial_energy:.2f}, Final energy: {metrics.current_energy:.2f}")
+    logger.info(
+        f"Energy reduction: {(metrics.initial_energy - metrics.current_energy) / metrics.initial_energy * 100:.2f}%")
+
+    return tasks, sequence_manager
+
+
+def evaluate_migration(tasks, task_idx, sequence_manager, source_unit, target_unit,
+                       migration_cache, power_models, upload_rates, download_rates):
+    """
+    Evaluates a potential task migration between different execution units in a three-tier architecture.
+
+    Args:
+        tasks: List of all tasks
+        task_idx: Index of task to be migrated
+        sequence_manager: SequenceManager object with current execution sequences
+        source_unit: Source ExecutionUnit (tier and location)
+        target_unit: Target ExecutionUnit (tier and location)
+        migration_cache: MigrationCache object for storing evaluation results
+        power_models: Dictionary of power consumption models
+        upload_rates: Dictionary of upload rates for different connections
+        download_rates: Dictionary of download rates for different connections
+
+    Returns:
+        tuple: (time, energy) representing application completion time and energy consumption after migration
+    """
+    # Generate cache key for this migration scenario
+    cache_key = generate_migration_cache_key(tasks, task_idx, source_unit, target_unit)
+
+    # Check cache for previously evaluated scenario
+    cached_result = migration_cache.get(cache_key)
+    if cached_result is not None:
+        return cached_result
+
+    # Create copies to avoid modifying original state
+    tasks_copy = deepcopy(tasks)
+    sequences_copy = deepcopy(sequence_manager.sequences)
+    sequence_manager_copy = SequenceManager(
+        num_device_cores=sequence_manager.num_device_cores,
+        num_edge_nodes=sequence_manager.num_edge_nodes,
+        num_edge_cores_per_node=sequence_manager.num_edge_cores_per_node
+    )
+    sequence_manager_copy.set_all_sequences(sequences_copy)
+
+    # Get task to migrate
+    task_to_migrate = tasks_copy[task_idx]
+
+    # Update task's execution unit
+    if target_unit.tier == ExecutionTier.DEVICE:
+        task_to_migrate.execution_tier = ExecutionTier.DEVICE
+        task_to_migrate.device_core = target_unit.location[0]
+        task_to_migrate.edge_assignment = None
+    elif target_unit.tier == ExecutionTier.EDGE:
+        task_to_migrate.execution_tier = ExecutionTier.EDGE
+        task_to_migrate.device_core = -1
+        task_to_migrate.edge_assignment = EdgeAssignment(
+            edge_id=target_unit.location[0] + 1,  # Convert to 1-based indexing
+            core_id=target_unit.location[1] + 1  # Convert to 1-based indexing
+        )
+    else:  # Cloud
+        task_to_migrate.execution_tier = ExecutionTier.CLOUD
+        task_to_migrate.device_core = -1
+        task_to_migrate.edge_assignment = None
+
+    # Construct new sequence
+    source_idx = sequence_manager_copy.unit_to_index_map[source_unit]
+    target_idx = sequence_manager_copy.unit_to_index_map[target_unit]
+
+    # Remove task from source sequence
+    if task_to_migrate.id in sequence_manager_copy.sequences[source_idx]:
+        sequence_manager_copy.sequences[source_idx].remove(task_to_migrate.id)
+
+    # Find insertion point in target sequence based on task ready time
+    target_sequence = sequence_manager_copy.sequences[target_idx]
+
+    # Calculate ready time based on task dependencies
+    ready_time = calculate_task_ready_time(task_to_migrate, tasks_copy, target_unit)
+
+    # Get execution times of tasks already in target sequence
+    task_start_times = []
+    for task_id in target_sequence:
+        task = next((t for t in tasks_copy if t.id == task_id), None)
+        if task and task.execution_unit_task_start_times:
+            start_time = task.execution_unit_task_start_times[target_idx]
+            task_start_times.append((task_id, start_time))
+
+    # Sort by start time
+    task_start_times.sort(key=lambda x: x[1])
+
+    # Find insertion point
+    insertion_idx = 0
+    for i, (tid, start_time) in enumerate(task_start_times):
+        if start_time >= ready_time:
+            insertion_idx = i
+            break
+        insertion_idx = i + 1
+
+    # Insert task at appropriate position
+    sequence_manager_copy.sequences[target_idx].insert(insertion_idx, task_to_migrate.id)
+
+    # Apply kernel algorithm for rescheduling
+    kernel_algorithm_3tier(
+        tasks=tasks_copy,
+        sequence_manager=sequence_manager_copy,
+        upload_rates=upload_rates,
+        download_rates=download_rates
+    )
+
+    # Calculate new metrics
+    new_time = total_time_3tier(tasks_copy)
+    new_energy = total_energy_3tier_with_rf(
+        tasks=tasks_copy,
+        device_power_profiles=power_models['device'],
+        rf_power=power_models['rf'],
+        upload_rates=upload_rates
+    )
+
+    # Cache and return results
+    result = (new_time, new_energy)
+    migration_cache.put(cache_key, result)
+
+    return result
+
+
+def calculate_task_ready_time(task, tasks, target_unit, upload_rates=None, download_rates=None):
+    """
+    Calculate the ready time for a task on a specific target execution unit.
+    Takes into account data transfer times between different tiers.
+
+    Args:
+        task: Task to calculate ready time for
+        tasks: All tasks in the application (needed for lookup)
+        target_unit: Target ExecutionUnit (tier and location)
+        upload_rates: Dictionary of upload rates for different connections
+        download_rates: Dictionary of download rates for different connections
+
+    Returns:
+        float: Earliest time the task can start execution
+    """
+    if not task.pred_tasks:
+        return 0.0  # Entry task
+
+    # Initialize default rates if not provided
+    upload_rates = upload_rates or {}
+    download_rates = download_rates or {}
+
+    # Find maximum ready time based on predecessors
+    max_ready_time = 0.0
+
+    for pred in task.pred_tasks:
+        # Base time when predecessor completes its execution
+        if pred.execution_tier == ExecutionTier.DEVICE:
+            pred_finish = pred.FT_l
+        elif pred.execution_tier == ExecutionTier.CLOUD:
+            pred_finish = pred.FT_c  # Cloud computation finish time
+        elif pred.execution_tier == ExecutionTier.EDGE:
+            if pred.edge_assignment:
+                edge_id = pred.edge_assignment.edge_id - 1  # Convert to 0-based
+                pred_finish = pred.FT_edge.get(edge_id, 0.0)
+            else:
+                pred_finish = 0.0
+        else:
+            pred_finish = 0.0
+
+        # Add data transfer time based on source and target tiers
+        transfer_time = 0.0
+
+        # Calculate transfer time from predecessor location to target unit
+        if pred.execution_tier != target_unit.tier:
+            # Different tiers - need data transfer
+            if pred.execution_tier == ExecutionTier.DEVICE and target_unit.tier == ExecutionTier.EDGE:
+                # Device → Edge transfer
+                edge_id = target_unit.location[0]
+                data_key = f'device_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0.0)
+                rate = upload_rates.get(data_key, 1.0)
+                transfer_time = data_size / rate if rate > 0 else 0.0
+
+            elif pred.execution_tier == ExecutionTier.DEVICE and target_unit.tier == ExecutionTier.CLOUD:
+                # Device → Cloud transfer
+                data_size = task.data_sizes.get('device_to_cloud', 0.0)
+                rate = upload_rates.get('device_to_cloud', 1.0)
+                transfer_time = data_size / rate if rate > 0 else 0.0
+
+            elif pred.execution_tier == ExecutionTier.EDGE and target_unit.tier == ExecutionTier.DEVICE:
+                # Edge → Device transfer
+                if pred.edge_assignment:
+                    edge_id = pred.edge_assignment.edge_id - 1
+                    data_key = f'edge{edge_id + 1}_to_device'
+                    data_size = task.data_sizes.get(data_key, 0.0)
+                    rate = download_rates.get(data_key, 1.0)
+                    transfer_time = data_size / rate if rate > 0 else 0.0
+
+            elif pred.execution_tier == ExecutionTier.EDGE and target_unit.tier == ExecutionTier.CLOUD:
+                # Edge → Cloud transfer
+                if pred.edge_assignment:
+                    edge_id = pred.edge_assignment.edge_id - 1
+                    data_key = f'edge{edge_id + 1}_to_cloud'
+                    data_size = task.data_sizes.get(data_key, 0.0)
+                    rate = upload_rates.get(data_key, 1.0)
+                    transfer_time = data_size / rate if rate > 0 else 0.0
+
+            elif pred.execution_tier == ExecutionTier.EDGE and target_unit.tier == ExecutionTier.EDGE:
+                # Edge → Edge transfer (if different edge nodes)
+                if pred.edge_assignment:
+                    source_edge_id = pred.edge_assignment.edge_id - 1
+                    target_edge_id = target_unit.location[0]
+                    if source_edge_id != target_edge_id:
+                        data_key = f'edge{source_edge_id + 1}_to_edge{target_edge_id + 1}'
+                        data_size = task.data_sizes.get(data_key, 0.0)
+                        rate = upload_rates.get(data_key, 1.0)
+                        transfer_time = data_size / rate if rate > 0 else 0.0
+
+            elif pred.execution_tier == ExecutionTier.CLOUD and target_unit.tier == ExecutionTier.DEVICE:
+                # Cloud → Device transfer
+                data_size = task.data_sizes.get('cloud_to_device', 0.0)
+                rate = download_rates.get('cloud_to_device', 1.0)
+                transfer_time = data_size / rate if rate > 0 else 0.0
+
+            elif pred.execution_tier == ExecutionTier.CLOUD and target_unit.tier == ExecutionTier.EDGE:
+                # Cloud → Edge transfer
+                edge_id = target_unit.location[0]
+                data_key = f'cloud_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0.0)
+                rate = download_rates.get(data_key, 1.0)
+                transfer_time = data_size / rate if rate > 0 else 0.0
+
+        # Total ready time = predecessor finish + transfer time
+        ready_time = pred_finish + transfer_time
+        max_ready_time = max(max_ready_time, ready_time)
+
+    return max_ready_time
+
+
+def construct_sequence(tasks, task_id, source_unit, target_unit, sequence_manager):
+    """
+    Implements the linear-time rescheduling algorithm for three-tier architecture.
+    Constructs new execution sequences after task migration while preserving task precedence.
+
+    Args:
+        tasks: List of all tasks in the application
+        task_id: ID of task being migrated
+        source_unit: Source ExecutionUnit (tier and location)
+        target_unit: Target ExecutionUnit (tier and location)
+        sequence_manager: SequenceManager object with current execution sequences
+
+    Returns:
+        Updated sequence_manager after task migration
+    """
+    # Step 1: Find the task to migrate
+    task_to_migrate = next((t for t in tasks if t.id == task_id), None)
+    if not task_to_migrate:
+        logger.error(f"Task {task_id} not found in task list")
+        return sequence_manager
+
+    # Step 2: Convert execution units to sequence indices
+    source_seq_idx = sequence_manager.unit_to_index_map.get(source_unit)
+    target_seq_idx = sequence_manager.unit_to_index_map.get(target_unit)
+
+    if source_seq_idx is None or target_seq_idx is None:
+        logger.error(f"Invalid source or target execution unit")
+        return sequence_manager
+
+    # Step 3: Get source and target sequences
+    source_sequence = sequence_manager.sequences[source_seq_idx]
+    target_sequence = sequence_manager.sequences[target_seq_idx]
+
+    # Step 4: Remove task from source sequence if present
+    if task_id in source_sequence:
+        source_sequence.remove(task_id)
+
+    # Step 5: Calculate ready time for the migrating task on the target execution unit
+    # This is the earliest time the task can start on the target unit
+    ready_time = 0.0
+
+    if hasattr(task_to_migrate, 'RT_l') and target_unit.tier == ExecutionTier.DEVICE:
+        ready_time = task_to_migrate.RT_l
+    elif hasattr(task_to_migrate, 'RT_ws') and target_unit.tier == ExecutionTier.CLOUD:
+        ready_time = task_to_migrate.RT_ws
+    elif hasattr(task_to_migrate, 'RT_edge') and target_unit.tier == ExecutionTier.EDGE:
+        edge_id = target_unit.location[0]
+        ready_time = task_to_migrate.RT_edge.get(edge_id, 0.0)
+
+    # If no specific ready time is available, calculate from predecessors
+    if ready_time <= 0:
+        for pred in task_to_migrate.pred_tasks:
+            pred_finish = 0.0
+
+            # Get predecessor finish time based on execution tier
+            if pred.execution_tier == ExecutionTier.DEVICE:
+                pred_finish = pred.FT_l
+            elif pred.execution_tier == ExecutionTier.CLOUD:
+                pred_finish = pred.FT_wr  # When device receives results
+            elif pred.execution_tier == ExecutionTier.EDGE:
+                if pred.edge_assignment:
+                    edge_id = pred.edge_assignment.edge_id - 1  # 0-based
+                    if hasattr(pred, 'FT_edge_receive') and edge_id in pred.FT_edge_receive:
+                        pred_finish = pred.FT_edge_receive[edge_id]
+                    elif hasattr(pred, 'FT_edge') and edge_id in pred.FT_edge:
+                        pred_finish = pred.FT_edge[edge_id]
+
+            ready_time = max(ready_time, pred_finish)
+
+    # Step 6: Get start times for tasks in target sequence
+    task_start_times = []
+    for tid in target_sequence:
+        task = next((t for t in tasks if t.id == tid), None)
+        if not task or not hasattr(task, 'execution_unit_task_start_times'):
+            continue
+
+        start_time = task.execution_unit_task_start_times[target_seq_idx]
+        if start_time >= 0:
+            task_start_times.append((tid, start_time))
+
+    # Sort tasks by start time
+    task_start_times.sort(key=lambda x: x[1])
+
+    # Step 7: Find insertion point for task based on ready_time
+    insertion_idx = 0
+    for i, (tid, start_time) in enumerate(task_start_times):
+        if start_time >= ready_time:
+            insertion_idx = target_sequence.index(tid)
+            break
+        if i == len(task_start_times) - 1:
+            # After all existing tasks
+            insertion_idx = len(target_sequence)
+
+    # Step 8: Insert task at the determined position
+    target_sequence.insert(insertion_idx, task_id)
+
+    # Step 9: Update task's execution tier and location
+    task_to_migrate.execution_tier = target_unit.tier
+
+    if target_unit.tier == ExecutionTier.DEVICE:
+        task_to_migrate.device_core = target_unit.location[0]
+        task_to_migrate.edge_assignment = None
+    elif target_unit.tier == ExecutionTier.EDGE:
+        task_to_migrate.device_core = -1
+        task_to_migrate.edge_assignment = EdgeAssignment(
+            edge_id=target_unit.location[0] + 1,  # Convert to 1-based indexing
+            core_id=target_unit.location[1] + 1  # Convert to 1-based indexing
+        )
+    else:  # CLOUD
+        task_to_migrate.device_core = -1
+        task_to_migrate.edge_assignment = None
+
+    # Update sequence manager with modified sequences
+    sequence_manager.sequences[source_seq_idx] = source_sequence
+    sequence_manager.sequences[target_seq_idx] = target_sequence
+
+    logger.info(f"Migrated Task {task_id} from {source_unit} to {target_unit}")
+    return sequence_manager
+
+
+def kernel_algorithm_3tier(tasks, sequence_manager, upload_rates=None, download_rates=None):
+    """
+    Implements the kernel (rescheduling) algorithm for three-tier architecture.
+    Provides linear-time task rescheduling for the task migration phase.
+
+    Args:
+        tasks: List of all tasks in the application
+        sequence_manager: SequenceManager with execution sequences for all units
+        upload_rates: Dictionary of upload rates for different connections
+        download_rates: Dictionary of download rates for different connections
+
+    Returns:
+        Updated tasks with new scheduling times
+    """
+    # Initialize the three-tier kernel scheduler
+    scheduler = ThreeTierKernelScheduler(
+        tasks=tasks,
+        sequence_manager=sequence_manager,
+        upload_rates=upload_rates or {},
+        download_rates=download_rates or {}
+    )
+
+    # Initialize ready task queue
+    ready_queue = scheduler.initialize_queue()
+
+    # Main scheduling loop - process until all tasks are scheduled
+    while ready_queue:
+        # Get next ready task from queue
+        current_task = ready_queue.popleft()
+
+        # Mark as scheduled in kernel phase
+        current_task.is_scheduled = SchedulingState.KERNEL_SCHEDULED
+
+        # Schedule based on execution tier
+        if current_task.execution_tier == ExecutionTier.DEVICE:
+            # Schedule on assigned device core
+            scheduler.schedule_device_task(current_task)
+
+        elif current_task.execution_tier == ExecutionTier.EDGE:
+            # Schedule on assigned edge node and core
+            scheduler.schedule_edge_task(current_task)
+
+        else:  # ExecutionTier.CLOUD
+            # Schedule three-phase cloud execution
+            scheduler.schedule_cloud_task(current_task)
+
+        # Update dependency and sequence readiness for all tasks
+        newly_ready_tasks = []
+        for task in tasks:
+            if task.is_scheduled == SchedulingState.KERNEL_SCHEDULED:
+                continue  # Skip already scheduled tasks
+
+            # Update readiness state
+            scheduler.update_task_readiness(task)
+
+            # Check if task is now ready for scheduling
+            if scheduler.is_task_ready(task) and task not in ready_queue:
+                newly_ready_tasks.append(task)
+
+        # Add newly ready tasks to queue
+        ready_queue.extend(newly_ready_tasks)
+
+    # Reset scheduling state for next iteration
     for task in tasks:
-        tid = getattr(task, 'id', '?')
-        if task.execution_tier == ExecutionTier.DEVICE:
-            # It's possible the code hasn't yet set FT_l if concurrency pass assigned it,
-            # but let's see if you want to enforce that. We'll do a soft check:
-            if hasattr(task, 'edge_assignment') and task.edge_assignment:
-                validation["tier_violations"] += 1
-                validation["issues"].append(
-                    f"Task {tid} is a device task but has an edge_assignment"
-                )
+        if task.is_scheduled == SchedulingState.KERNEL_SCHEDULED:
+            task.is_scheduled = SchedulingState.SCHEDULED
 
-            # If we want to confirm it was actually scheduled and has a positive finish time:
-            if hasattr(task, 'FT_l') and task.FT_l <= 0:
-                # This might be a clue that it never ran or concurrency pass didn't set it
-                validation["tier_violations"] += 1
-                validation["issues"].append(
-                    f"Task {tid} is device-tier but has no local finish time"
-                )
+    return tasks
 
-        elif task.execution_tier == ExecutionTier.EDGE:
-            # We check if it has FT_edge
-            if not hasattr(task, 'edge_assignment') or not task.edge_assignment:
-                validation["tier_violations"] += 1
-                validation["issues"].append(
-                    f"Task {tid} is edge-tier but has no edge_assignment"
-                )
 
-        elif task.execution_tier == ExecutionTier.CLOUD:
-            # Check if it has some FT_ws, FT_c, FT_wr
-            if (getattr(task, 'FT_ws', 0) <= 0 or
-                    getattr(task, 'FT_c', 0) <= 0 or
-                    getattr(task, 'FT_wr', 0) <= 0):
-                validation["tier_violations"] += 1
-                validation["issues"].append(
-                    f"Task {tid} is cloud-tier but missing some cloud times"
-                )
+class ThreeTierKernelScheduler:
+    """
+    Kernel scheduler implementation for three-tier architecture.
+    Manages task scheduling across device cores, edge nodes, and cloud.
+    """
 
-    # ----------------------------------------------------
-    # Summarize
-    # ----------------------------------------------------
-    if (validation["dependency_violations"] > 0 or
-            validation["sequence_violations"] > 0 or
-            validation["resource_violations"] > 0 or
-            validation["tier_violations"] > 0 or
-            validation["unscheduled_tasks"] > 0):
-        validation["valid"] = False
+    def __init__(self, tasks, sequence_manager, upload_rates, download_rates):
+        """Initialize scheduler state for three-tier architecture."""
+        self.tasks = tasks
+        self.sequence_manager = sequence_manager
+        self.upload_rates = upload_rates
+        self.download_rates = download_rates
 
-    return validation
+        # Get system configuration
+        self.num_device_cores = sequence_manager.num_device_cores
+        self.num_edge_nodes = sequence_manager.num_edge_nodes
+        self.num_edge_cores_per_node = sequence_manager.num_edge_cores_per_node
 
+        # Initialize execution unit readiness tracking
+        # 1. Device cores
+        self.device_cores_ready = [0.0] * self.num_device_cores
+
+        # 2. Edge cores (per node)
+        self.edge_cores_ready = [
+            [0.0] * self.num_edge_cores_per_node
+            for _ in range(self.num_edge_nodes)
+        ]
+
+        # 3. Cloud phases
+        self.cloud_upload_ready = 0.0  # Wireless sending channel
+        self.cloud_compute_ready = 0.0  # Cloud computation resources
+        self.cloud_download_ready = 0.0  # Wireless receiving channel
+
+        # 4. Communication channels
+        # Device <-> Edge channels
+        self.device_to_edge_ready = [0.0] * self.num_edge_nodes
+        self.edge_to_device_ready = [0.0] * self.num_edge_nodes
+
+        # Edge <-> Cloud channels
+        self.edge_to_cloud_ready = [0.0] * self.num_edge_nodes
+        self.cloud_to_edge_ready = [0.0] * self.num_edge_nodes
+
+        # Edge <-> Edge channels
+        self.edge_to_edge_ready = [
+            [0.0] * self.num_edge_nodes
+            for _ in range(self.num_edge_nodes)
+        ]
+
+        # Initialize task readiness tracking vectors
+        self.dependency_ready = {}  # Maps task ID -> number of unscheduled predecessors
+        self.sequence_ready = {}  # Maps task ID -> sequence readiness state
+
+        # Initialize the readiness tracking for all tasks
+        self.initialize_task_readiness()
+
+    def initialize_task_readiness(self):
+        """Initialize task dependency and sequence readiness tracking."""
+        # Track dependency readiness (similar to ready1 vector)
+        for task in self.tasks:
+            # Count number of predecessors not yet scheduled
+            self.dependency_ready[task.id] = len(task.pred_tasks)
+
+        # Track sequence readiness (similar to ready2 vector)
+        for task in self.tasks:
+            # Default: not in any sequence
+            self.sequence_ready[task.id] = -1
+
+        # Mark first task in each sequence as ready
+        for seq_idx, sequence in enumerate(self.sequence_manager.sequences):
+            if sequence:  # Non-empty sequence
+                first_task_id = sequence[0]
+                self.sequence_ready[first_task_id] = 0  # Ready in sequence
+
+    def initialize_queue(self):
+        """Initialize queue with tasks that are ready for scheduling."""
+        from collections import deque
+
+        # A task is ready if:
+        # 1. All predecessors are scheduled (dependency_ready[id] == 0)
+        # 2. It's the first task in its sequence (sequence_ready[id] == 0)
+        ready_queue = deque()
+
+        for task in self.tasks:
+            if (self.dependency_ready[task.id] == 0 and
+                    self.sequence_ready[task.id] == 0 and
+                    task.is_scheduled != SchedulingState.KERNEL_SCHEDULED):
+                ready_queue.append(task)
+
+        return ready_queue
+
+    def update_task_readiness(self, task):
+        """Update dependency and sequence readiness state for a task."""
+        # 1. Update dependency readiness (count unscheduled predecessors)
+        unscheduled_preds = sum(
+            1 for pred in task.pred_tasks
+            if pred.is_scheduled != SchedulingState.KERNEL_SCHEDULED
+        )
+        self.dependency_ready[task.id] = unscheduled_preds
+
+        # 2. Update sequence readiness
+        # Find task's sequence and position
+        for seq_idx, sequence in enumerate(self.sequence_manager.sequences):
+            if task.id in sequence:
+                task_pos = sequence.index(task.id)
+
+                if task_pos == 0:
+                    # First task in sequence is ready if all predecessors scheduled
+                    self.sequence_ready[task.id] = 0
+                else:
+                    # Check if previous task in sequence is scheduled
+                    prev_task_id = sequence[task_pos - 1]
+                    prev_task = next((t for t in self.tasks if t.id == prev_task_id), None)
+
+                    if prev_task and prev_task.is_scheduled == SchedulingState.KERNEL_SCHEDULED:
+                        self.sequence_ready[task.id] = 0  # Ready in sequence
+                    else:
+                        self.sequence_ready[task.id] = 1  # Not ready in sequence
+
+                break  # Found the sequence containing this task
+
+    def is_task_ready(self, task):
+        """Check if a task is ready for scheduling."""
+        return (self.dependency_ready[task.id] == 0 and
+                self.sequence_ready[task.id] == 0 and
+                task.is_scheduled != SchedulingState.KERNEL_SCHEDULED)
+
+    def schedule_device_task(self, task):
+        """Schedule a task for execution on a device core."""
+        # Verify task is assigned to device
+        if task.execution_tier != ExecutionTier.DEVICE or task.device_core < 0:
+            logger.error(f"Task {task.id} not properly assigned to device")
+            return
+
+        core_id = task.device_core
+
+        # Calculate ready time from predecessors
+        pred_ready_time = self.calculate_device_ready_time(task)
+
+        # Determine actual start time based on core availability
+        start_time = max(pred_ready_time, self.device_cores_ready[core_id])
+
+        # Store start time for concurrency tracking
+        if not hasattr(task, 'execution_unit_task_start_times') or task.execution_unit_task_start_times is None:
+            task.execution_unit_task_start_times = [-1.0] * len(self.sequence_manager.sequences)
+
+        task.execution_unit_task_start_times[core_id] = start_time
+
+        # Calculate finish time
+        execution_time = task.local_execution_times[core_id]
+        finish_time = start_time + execution_time
+
+        # Update task timing information
+        task.RT_l = pred_ready_time
+        task.FT_l = finish_time
+        task.execution_finish_time = finish_time
+
+        # Clear cloud and edge execution times
+        task.RT_ws = task.FT_ws = task.RT_c = task.FT_c = task.RT_wr = task.FT_wr = -1
+        if hasattr(task, 'FT_edge'):
+            task.FT_edge = {}
+        if hasattr(task, 'FT_edge_receive'):
+            task.FT_edge_receive = {}
+
+        # Update core availability
+        self.device_cores_ready[core_id] = finish_time
+
+        logger.info(
+            f"Scheduled task {task.id} on device core {core_id}: start={start_time:.2f}, finish={finish_time:.2f}")
+
+    def schedule_edge_task(self, task):
+        """Schedule a task for execution on an edge node."""
+        # Verify task is assigned to edge
+        if task.execution_tier != ExecutionTier.EDGE or not task.edge_assignment:
+            logger.error(f"Task {task.id} not properly assigned to edge")
+            return
+
+        # Get edge node and core (convert to 0-based)
+        edge_id = task.edge_assignment.edge_id - 1
+        core_id = task.edge_assignment.core_id - 1
+
+        # Calculate ready time from predecessors and data transfers
+        pred_ready_time = self.calculate_edge_ready_time(task, edge_id)
+
+        # Determine actual start time based on edge core availability
+        start_time = max(pred_ready_time, self.edge_cores_ready[edge_id][core_id])
+
+        # Store start time for concurrency tracking
+        if not hasattr(task, 'execution_unit_task_start_times') or task.execution_unit_task_start_times is None:
+            task.execution_unit_task_start_times = [-1.0] * len(self.sequence_manager.sequences)
+
+        # Find execution unit index in sequence_manager
+        edge_unit = ExecutionUnit(ExecutionTier.EDGE, (edge_id, core_id))
+        unit_idx = self.sequence_manager.unit_to_index_map.get(edge_unit, -1)
+
+        if unit_idx >= 0:
+            task.execution_unit_task_start_times[unit_idx] = start_time
+
+        # Calculate finish time
+        execution_time = task.get_edge_execution_time(edge_id + 1, core_id + 1)
+        finish_time = start_time + execution_time
+
+        # Update task timing information
+        if not hasattr(task, 'RT_edge'):
+            task.RT_edge = {}
+        if not hasattr(task, 'FT_edge'):
+            task.FT_edge = {}
+
+        task.RT_edge[edge_id] = pred_ready_time
+        task.FT_edge[edge_id] = finish_time
+        task.execution_finish_time = finish_time
+
+        # Calculate edge-to-device transfer time for results
+        # This is needed by tasks that will execute on device after this task
+        edge_to_device_key = f'edge{edge_id + 1}_to_device'
+        data_size = task.data_sizes.get(edge_to_device_key, 0.0)
+        download_rate = self.download_rates.get(edge_to_device_key, 1.0)
+        transfer_time = data_size / download_rate if download_rate > 0 else 0.0
+
+        # Determine transfer start time based on channel availability
+        transfer_start = max(finish_time, self.edge_to_device_ready[edge_id])
+        receive_time = transfer_start + transfer_time
+
+        # Update result receive time
+        if not hasattr(task, 'FT_edge_receive'):
+            task.FT_edge_receive = {}
+        task.FT_edge_receive[edge_id] = receive_time
+
+        # Update edge core and channel availability
+        self.edge_cores_ready[edge_id][core_id] = finish_time
+        self.edge_to_device_ready[edge_id] = receive_time
+
+        # Clear device and cloud execution times
+        task.RT_l = task.FT_l = -1
+        task.RT_ws = task.FT_ws = task.RT_c = task.FT_c = task.RT_wr = task.FT_wr = -1
+
+        logger.info(f"Scheduled task {task.id} on edge {edge_id}, core {core_id}: " +
+                    f"start={start_time:.2f}, finish={finish_time:.2f}, receive={receive_time:.2f}")
+
+    def schedule_cloud_task(self, task):
+        """Schedule a task for three-phase execution on the cloud."""
+        # Verify task is assigned to cloud
+        if task.execution_tier != ExecutionTier.CLOUD:
+            logger.error(f"Task {task.id} not properly assigned to cloud")
+            return
+
+        # ---- Phase 1: Upload ----
+        # Calculate ready time for cloud upload
+        upload_ready_time = self.calculate_cloud_upload_ready_time(task)
+
+        # Determine actual upload start time based on channel availability
+        upload_start = max(upload_ready_time, self.cloud_upload_ready)
+
+        # Store start time for concurrency tracking
+        if not hasattr(task, 'execution_unit_task_start_times') or task.execution_unit_task_start_times is None:
+            task.execution_unit_task_start_times = [-1.0] * len(self.sequence_manager.sequences)
+
+        # Find cloud index in sequence_manager
+        cloud_unit = ExecutionUnit(ExecutionTier.CLOUD)
+        cloud_idx = self.sequence_manager.unit_to_index_map.get(cloud_unit, -1)
+
+        if cloud_idx >= 0:
+            task.execution_unit_task_start_times[cloud_idx] = upload_start
+
+        # Calculate upload finish time
+        upload_time = task.cloud_execution_times[0]  # T_send
+        upload_finish = upload_start + upload_time
+
+        # ---- Phase 2: Cloud Computation ----
+        # Calculate ready time for cloud computation
+        compute_ready_time = max(
+            upload_finish,  # Must finish uploading
+            self.cloud_compute_ready  # Cloud resources must be available
+        )
+
+        # Calculate computation finish time
+        compute_time = task.cloud_execution_times[1]  # T_cloud
+        compute_finish = compute_ready_time + compute_time
+
+        # ---- Phase 3: Download ----
+        # Calculate ready time for result download
+        download_ready_time = max(
+            compute_finish,  # Must finish computation
+            self.cloud_download_ready  # Download channel must be available
+        )
+
+        # Calculate download finish time
+        download_time = task.cloud_execution_times[2]  # T_receive
+        download_finish = download_ready_time + download_time
+
+        # Update task timing information
+        task.RT_ws = upload_ready_time
+        task.FT_ws = upload_finish
+        task.RT_c = compute_ready_time
+        task.FT_c = compute_finish
+        task.RT_wr = download_ready_time
+        task.FT_wr = download_finish
+        task.execution_finish_time = download_finish
+
+        # Clear device and edge execution times
+        task.RT_l = task.FT_l = -1
+        if hasattr(task, 'FT_edge'):
+            task.FT_edge = {}
+        if hasattr(task, 'FT_edge_receive'):
+            task.FT_edge_receive = {}
+
+        # Update channel and resource availability
+        self.cloud_upload_ready = upload_finish
+        self.cloud_compute_ready = compute_finish
+        self.cloud_download_ready = download_finish
+
+        logger.info(f"Scheduled task {task.id} on cloud: " +
+                    f"upload={upload_start:.2f}-{upload_finish:.2f}, " +
+                    f"compute={compute_ready_time:.2f}-{compute_finish:.2f}, " +
+                    f"download={download_ready_time:.2f}-{download_finish:.2f}")
+
+    def calculate_device_ready_time(self, task):
+        """Calculate ready time for a task on a device core."""
+        if not task.pred_tasks:
+            return 0.0  # Entry task
+
+        max_ready_time = 0.0
+
+        for pred in task.pred_tasks:
+            pred_finish = 0.0
+
+            # Different logic based on predecessor execution tier
+            if pred.execution_tier == ExecutionTier.DEVICE:
+                # Local execution - results available immediately
+                pred_finish = pred.FT_l
+
+            elif pred.execution_tier == ExecutionTier.CLOUD:
+                # Cloud execution - must wait for download
+                pred_finish = pred.FT_wr
+
+            elif pred.execution_tier == ExecutionTier.EDGE:
+                # Edge execution - must wait for edge-to-device transfer
+                if pred.edge_assignment:
+                    edge_id = pred.edge_assignment.edge_id - 1  # 0-based
+                    if hasattr(pred, 'FT_edge_receive') and edge_id in pred.FT_edge_receive:
+                        pred_finish = pred.FT_edge_receive[edge_id]
+                    else:
+                        # Fallback to edge execution finish time
+                        pred_finish = pred.FT_edge.get(edge_id, 0.0)
+
+            max_ready_time = max(max_ready_time, pred_finish)
+
+        return max_ready_time
+
+    def calculate_edge_ready_time(self, task, edge_id):
+        """Calculate ready time for a task on an edge node."""
+        if not task.pred_tasks:
+            return 0.0  # Entry task
+
+        max_ready_time = 0.0
+
+        for pred in task.pred_tasks:
+            # Base time when predecessor completes its execution
+            if pred.execution_tier == ExecutionTier.DEVICE:
+                # Device -> Edge transfer needed
+                pred_complete = pred.FT_l
+
+                # Add device->edge transfer time
+                data_key = f'device_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0.0)
+                rate = self.upload_rates.get(data_key, 1.0)
+
+                # Account for channel contention
+                transfer_start = max(pred_complete, self.device_to_edge_ready[edge_id])
+                transfer_time = data_size / rate if rate > 0 else 0.0
+                pred_finish = transfer_start + transfer_time
+
+                # Update channel availability
+                self.device_to_edge_ready[edge_id] = pred_finish
+
+            elif pred.execution_tier == ExecutionTier.CLOUD:
+                # Cloud -> Edge transfer needed
+                pred_complete = pred.FT_c
+
+                # Add cloud->edge transfer time
+                data_key = f'cloud_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0.0)
+                rate = self.download_rates.get(data_key, 1.0)
+
+                # Account for channel contention
+                transfer_start = max(pred_complete, self.cloud_to_edge_ready[edge_id])
+                transfer_time = data_size / rate if rate > 0 else 0.0
+                pred_finish = transfer_start + transfer_time
+
+                # Update channel availability
+                self.cloud_to_edge_ready[edge_id] = pred_finish
+
+            elif pred.execution_tier == ExecutionTier.EDGE:
+                if not pred.edge_assignment:
+                    pred_finish = 0.0
+                    continue
+
+                pred_edge_id = pred.edge_assignment.edge_id - 1
+
+                if pred_edge_id == edge_id:
+                    # Same edge node - no transfer needed
+                    pred_finish = pred.FT_edge.get(pred_edge_id, 0.0)
+                else:
+                    # Different edge node - edge->edge transfer needed
+                    pred_complete = pred.FT_edge.get(pred_edge_id, 0.0)
+
+                    # Add edge->edge transfer time
+                    data_key = f'edge{pred_edge_id + 1}_to_edge{edge_id + 1}'
+                    data_size = task.data_sizes.get(data_key, 0.0)
+                    rate = self.upload_rates.get(data_key, 1.0)
+
+                    # Account for channel contention
+                    transfer_start = max(pred_complete, self.edge_to_edge_ready[pred_edge_id][edge_id])
+                    transfer_time = data_size / rate if rate > 0 else 0.0
+                    pred_finish = transfer_start + transfer_time
+
+                    # Update channel availability
+                    self.edge_to_edge_ready[pred_edge_id][edge_id] = pred_finish
+            else:
+                pred_finish = 0.0
+
+            max_ready_time = max(max_ready_time, pred_finish)
+
+        return max_ready_time
+
+    def calculate_cloud_upload_ready_time(self, task):
+        """Calculate ready time for cloud upload phase."""
+        if not task.pred_tasks:
+            return 0.0  # Entry task
+
+        max_ready_time = 0.0
+
+        for pred in task.pred_tasks:
+            # Different logic based on predecessor execution tier
+            if pred.execution_tier == ExecutionTier.DEVICE:
+                # Device execution - results available at FT_l
+                pred_finish = pred.FT_l
+
+            elif pred.execution_tier == ExecutionTier.CLOUD:
+                # For cloud execution, we need results from previous cloud upload
+                pred_finish = pred.FT_ws
+
+            elif pred.execution_tier == ExecutionTier.EDGE:
+                # Edge execution - need to determine edge-to-cloud path
+                if not pred.edge_assignment:
+                    pred_finish = 0.0
+                    continue
+
+                edge_id = pred.edge_assignment.edge_id - 1
+                pred_complete = pred.FT_edge.get(edge_id, 0.0)
+
+                # Check if direct edge->cloud channel is being used
+                # This would be modeled with edge_to_cloud_ready
+                if hasattr(self, 'edge_to_cloud_ready'):
+                    # Add edge->cloud transfer time
+                    data_key = f'edge{edge_id + 1}_to_cloud'
+                    data_size = task.data_sizes.get(data_key, 0.0)
+                    rate = self.upload_rates.get(data_key, 1.0)
+
+                    # Account for channel contention
+                    transfer_start = max(pred_complete, self.edge_to_cloud_ready[edge_id])
+                    transfer_time = data_size / rate if rate > 0 else 0.0
+                    pred_finish = transfer_start + transfer_time
+
+                    # Update channel availability
+                    self.edge_to_cloud_ready[edge_id] = pred_finish
+                else:
+                    # Fallback - assume data comes through device
+                    pred_finish = pred_complete
+
+            max_ready_time = max(max_ready_time, pred_finish)
+
+        return max_ready_time
 
 def validate_task_dependencies(tasks, epsilon=1e-9):
     """
@@ -3046,20 +3820,173 @@ def plot_three_tier_gantt(tasks, scheduler, title="Three-Tier Schedule"):
     plt.tight_layout()
     plt.show()
 
+def generate_realistic_power_models(device_type='mobile', battery_level=100):
+    """
+    Generate realistic power consumption models that vary with load.
+
+    Parameters:
+        device_type: Type of device ('mobile', 'edge_server', 'cloud_server')
+        battery_level: Current battery percentage (mobile only)
+
+    Returns:
+        Dictionary of power models for different processing units
+    """
+    # Base power models with load-dependent functions
+    power_models = {
+        'device': {},
+        'edge': {},
+        'cloud': {},
+        'rf': {}
+    }
+
+    # Mobile device power characteristics
+    if device_type == 'mobile':
+        # Battery efficiency drops as battery level decreases
+        battery_factor = 1.0 if battery_level > 30 else 1.0 + (30 - battery_level) * 0.01
+
+        # Different cores have different power profiles
+        # Power = idle_power + (load * dynamic_power * frequency^2)
+        power_models['device'] = {
+            0: {  # High-performance core
+                'idle_power': 0.1 * battery_factor,
+                'dynamic_power': lambda load: (0.2 + 1.8 * load) * battery_factor,
+                'frequency_range': (0.8, 2.4),  # GHz
+                'current_frequency': 2.0,
+                'dvfs_enabled': True
+            },
+            1: {  # Mid-range core
+                'idle_power': 0.05 * battery_factor,
+                'dynamic_power': lambda load: (0.1 + 1.4 * load) * battery_factor,
+                'frequency_range': (0.6, 1.8),
+                'current_frequency': 1.6,
+                'dvfs_enabled': True
+            },
+            2: {  # Efficiency core
+                'idle_power': 0.03 * battery_factor,
+                'dynamic_power': lambda load: (0.05 + 0.95 * load) * battery_factor,
+                'frequency_range': (0.5, 1.5),
+                'current_frequency': 1.2,
+                'dvfs_enabled': True
+            }
+        }
+
+        # RF transmission power varies with signal strength and data rate
+        power_models['rf'] = {
+            'device_to_edge': lambda data_rate, signal_strength:
+            (0.1 + 0.4 * (data_rate / 10) * (1 + (70 - signal_strength) * 0.02)) * battery_factor,
+            'device_to_cloud': lambda data_rate, signal_strength:
+            (0.15 + 0.6 * (data_rate / 5) * (1 + (70 - signal_strength) * 0.03)) * battery_factor,
+        }
+
+    # Edge server power characteristics - more power efficient than mobile, less than cloud
+    elif device_type == 'edge_server':
+        for edge_id in range(1, 3):  # Two edge nodes
+            for core_id in range(1, 3):  # Two cores per node
+                efficiency = 1.0 - 0.1 * (edge_id - 1) - 0.05 * (core_id - 1)  # First edge, first core most efficient
+                power_models['edge'][(edge_id, core_id)] = {
+                    'idle_power': 5.0 * efficiency,
+                    'dynamic_power': lambda load: (3.0 + 12.0 * load) * efficiency,
+                    'frequency_range': (1.0, 3.2),
+                    'current_frequency': 2.8,
+                    'dvfs_enabled': True
+                }
+
+    # Cloud server power characteristics - highest absolute power but most efficient per computation
+    elif device_type == 'cloud_server':
+        power_models['cloud'] = {
+            'idle_power': 50.0,
+            'dynamic_power': lambda load: (20.0 + 180.0 * load),
+            'frequency_range': (2.0, 4.0),
+            'current_frequency': 3.5,
+            'virtualization_overhead': 0.1  # 10% overhead due to virtualization
+        }
+
+    return power_models
+
+
+def format_schedule_3tier(tasks, scheduler):
+    """
+    Builds a formatted table of the scheduled tasks in a three-tier environment.
+    Shows:
+        Task  |  Tier        |  Start Time  |  Finish Time |  Resource
+
+    Args:
+        tasks: List of Task objects that have:
+               - execution_tier
+               - device_core
+               - edge_assignment
+               - execution_finish_time
+               - execution_unit_task_start_times
+        scheduler: A reference to the ThreeTierTaskScheduler (or whichever object
+                   provides get_edge_core_index() and get_cloud_index()) so we can
+                   determine the correct index for edge/cloud resources.
+
+    Returns:
+        A multi-line string containing the formatted schedule table.
+    """
+
+    header = f"{'Task':<5}  {'Tier':<10}  {'Start':>7}  {'Finish':>7}  Resource"
+    sep_line = "-" * len(header)
+
+    lines = [header, sep_line]
+
+    for t in tasks:
+        # Retrieve finish time
+        finish_time = getattr(t, 'execution_finish_time', 0.0)
+        tier_name = (t.execution_tier.name if hasattr(t, 'execution_tier') and t.execution_tier
+                     else "UNASSIGNED")
+
+        # Default or fallback if we cannot find the correct start
+        start_time = 0.0
+        resource_str = "N/A"
+
+        if t.execution_tier == ExecutionTier.DEVICE:
+            # e.g. "Device Core 2"
+            core_id = getattr(t, 'device_core', -1)
+            resource_str = f"Device Core {core_id}"
+            # If we have valid start times array and a valid core index
+            if (t.execution_unit_task_start_times
+                    and 0 <= core_id < len(t.execution_unit_task_start_times)):
+                start_time = t.execution_unit_task_start_times[core_id]
+
+        elif t.execution_tier == ExecutionTier.EDGE and t.edge_assignment:
+            # e.g. "Edge(Node=1, Core=2)"
+            e_id = t.edge_assignment.edge_id - 1  # 0-based
+            c_id = t.edge_assignment.core_id - 1  # 0-based
+            resource_str = f"Edge(Node={e_id + 1}, Core={c_id + 1})"
+
+            # get the sequence index from your scheduler method
+            seq_idx = scheduler.get_edge_core_index(e_id, c_id)
+
+            if (t.execution_unit_task_start_times
+                    and 0 <= seq_idx < len(t.execution_unit_task_start_times)):
+                start_time = t.execution_unit_task_start_times[seq_idx]
+
+        elif t.execution_tier == ExecutionTier.CLOUD:
+            resource_str = "Cloud"
+            # If your code places the cloud start time at cloud_idx
+            cloud_idx = scheduler.get_cloud_index()
+            if (t.execution_unit_task_start_times
+                    and 0 <= cloud_idx < len(t.execution_unit_task_start_times)):
+                start_time = t.execution_unit_task_start_times[cloud_idx]
+
+        # Build a single row for the table
+        lines.append(
+            f"{t.id:<5}  {tier_name:<10}  {start_time:7.2f}  {finish_time:7.2f}  {resource_str}"
+        )
+
+    return "\n".join(lines)
+
 ####################################
 # SECTION: MAIN PROGRAM EXECUTION
 ####################################
 if __name__ == "__main__":
     # 1) Realistic network conditions
     upload_rates, download_rates = generate_realistic_network_conditions()
-
     # 2) Generate mobile power models (which includes 'device' cores and 'rf')
     mobile_power_models = generate_realistic_power_models(device_type='mobile', battery_level=65)
     device_power_profiles = mobile_power_models.get('device', {})
     rf_power = mobile_power_models.get('rf', {})
-
-    # (Optional) If you want to populate or re-populate edge_execution_times:
-    # initialize_edge_execution_times()
 
     # 3) Build or define your DAG tasks
     task20 = Task(id=20, succ_task=[])
@@ -3156,22 +4083,17 @@ if __name__ == "__main__":
     # 10) total_time_3tier => max finish time among exit tasks
     T_total = total_time_3tier(tasks)
 
-    # 11) total_energy_3tier_with_rf => device energy usage
     E_total = total_energy_3tier_with_rf(
         tasks,
         device_power_profiles=device_power_profiles,
         rf_power=rf_power,
-        # You can pass the same dictionary from step 1, or a subset:
-        upload_rates={
-            'device_to_edge': upload_rates.get('device_to_edge', 6.0),
-            'device_to_cloud': upload_rates.get('device_to_cloud', 3.0)
-        },
-        default_signal_strength=65.0
+        upload_rates=upload_rates,
+        default_signal_strength=70.0
     )
 
     print("\n=== SCHEDULING RESULTS ===")
     print(f"Total Completion Time (Three-Tier): {T_total:.2f}")
-    print(f"Total Device Energy Consumption: {E_total:.4f} J")
+    print(f"Total Energy Consumption: {E_total:.2f} Joules")
 
     # 12) Print a fully formatted schedule table (showing start times)
     schedule_str = format_schedule_3tier(tasks, scheduler)
@@ -3185,4 +4107,123 @@ if __name__ == "__main__":
         print("\nSchedule has DAG/time violations:")
         for v in violations:
             print(f" - {v}")
-    plot_three_tier_gantt(tasks,scheduler)
+
+    # ========================================================
+    # STEP TWO: ENERGY OPTIMIZATION PHASE
+    # ========================================================
+    print("\n=== STARTING ENERGY OPTIMIZATION PHASE ===")
+    print(f"Initial completion time: {T_total:.2f}")
+    print(f"Initial energy consumption: {E_total:.2f} Joules")
+
+    # Create a SequenceManager from the current task assignment
+    sequence_manager = SequenceManager(
+        num_device_cores=3,
+        num_edge_nodes=2,
+        num_edge_cores_per_node=2
+    )
+
+    # Build sequences from current task schedule
+    device_sequences = [[] for _ in range(3)]  # 3 device cores
+    edge_sequences = [[] for _ in range(4)]  # 2 edge nodes × 2 cores per node
+    cloud_sequence = []
+
+    # Populate sequences based on current task assignments
+    for task in tasks:
+        if task.execution_tier == ExecutionTier.DEVICE:
+            core_id = task.device_core
+            device_sequences[core_id].append(task.id)
+        elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+            edge_id = task.edge_assignment.edge_id - 1  # Convert to 0-based
+            core_id = task.edge_assignment.core_id - 1  # Convert to 0-based
+            edge_idx = edge_id * 2 + core_id  # Calculate edge sequence index
+            edge_sequences[edge_idx].append(task.id)
+        elif task.execution_tier == ExecutionTier.CLOUD:
+            cloud_sequence.append(task.id)
+
+    # Set all sequences
+    all_sequences = device_sequences + edge_sequences + [cloud_sequence]
+    sequence_manager.set_all_sequences(all_sequences)
+
+    # Set time constraint - typically we'd allow some flexibility
+    T_max = T_total * 1.2  # Allow 20% increase in completion time
+
+    # Create migration cache
+    migration_cache = MigrationCache(capacity=10000)
+
+    # Set power models
+    power_models = {
+        'device': device_power_profiles,
+        'rf': rf_power
+    }
+
+    # Run the optimization algorithm
+    print("\nRunning task migration optimization...\n")
+    optimized_tasks, optimized_sequence_manager = optimize_task_scheduling(
+        tasks=tasks,
+        sequence_manager=sequence_manager,
+        T_final=T_max,
+        power_models=power_models,
+        upload_rates=upload_rates,
+        download_rates=download_rates,
+        migration_cache=migration_cache,
+        max_iterations=50
+    )
+
+    # Calculate the new metrics
+    optimized_time = total_time_3tier(optimized_tasks)
+    optimized_energy = total_energy_3tier_with_rf(
+        tasks=optimized_tasks,
+        device_power_profiles=device_power_profiles,
+        rf_power=rf_power,
+        upload_rates=upload_rates
+    )
+
+    # Print the optimized schedule
+    print("\n=== OPTIMIZED SCHEDULE RESULTS ===")
+    print(f"Final Completion Time: {optimized_time:.2f} (Initial: {T_total:.2f})")
+    print(f"Final Energy Consumption: {optimized_energy:.2f} Joules (Initial: {E_total:.2f})")
+    print(f"Energy Reduction: {((E_total - optimized_energy) / E_total * 100):.2f}%")
+    print(f"Completion Time Change: {((optimized_time - T_total) / T_total * 100):.2f}%")
+
+    # Compare task assignments before and after optimization
+    print("\nTask Assignment Changes:")
+    for task in optimized_tasks:
+        # Find the original task
+        original_task = next((t for t in tasks if t.id == task.id), None)
+
+        if original_task:
+            original_tier = original_task.execution_tier.name
+            optimized_tier = task.execution_tier.name
+
+            # Get resource information
+            if original_task.execution_tier == ExecutionTier.DEVICE:
+                original_resource = f"Device Core {original_task.device_core}"
+            elif original_task.execution_tier == ExecutionTier.EDGE and original_task.edge_assignment:
+                original_resource = f"Edge(Node={original_task.edge_assignment.edge_id}, Core={original_task.edge_assignment.core_id})"
+            else:
+                original_resource = "Cloud"
+
+            if task.execution_tier == ExecutionTier.DEVICE:
+                optimized_resource = f"Device Core {task.device_core}"
+            elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
+                optimized_resource = f"Edge(Node={task.edge_assignment.edge_id}, Core={task.edge_assignment.core_id})"
+            else:
+                optimized_resource = "Cloud"
+
+            # Only print tasks that changed
+            if original_tier != optimized_tier or original_resource != optimized_resource:
+                print(f"Task {task.id}: {original_tier}({original_resource}) → {optimized_tier}({optimized_resource})")
+
+    # Validate the optimized schedule
+    is_valid, violations = validate_task_dependencies(optimized_tasks)
+    if is_valid:
+        print("\nOptimized schedule is valid: no dependency violations.")
+    else:
+        print("\nOptimized schedule has DAG/time violations:")
+        for v in violations:
+            print(f" - {v}")
+
+    # Print the optimized schedule table
+    optimized_schedule_str = format_schedule_3tier(optimized_tasks, scheduler)
+    print("\nFormatted optimized schedule:")
+    print(optimized_schedule_str)
