@@ -2383,12 +2383,6 @@ def optimize_task_scheduling(tasks, sequence_manager, T_final,
             migration_cache.clear()
 
     # Log optimization results
-    logger.info(f"Task migration completed: {iteration} iterations")
-    logger.info(f"Initial time: {metrics.initial_time:.2f}, Final time: {metrics.current_time:.2f}")
-    logger.info(f"Initial energy: {metrics.initial_energy:.2f}, Final energy: {metrics.current_energy:.2f}")
-    logger.info(
-        f"Energy reduction: {(metrics.initial_energy - metrics.current_energy) / metrics.initial_energy * 100:.2f}%")
-
     return tasks, sequence_manager
 
 
@@ -2975,9 +2969,6 @@ class ThreeTierKernelScheduler:
         # Update core availability
         self.device_cores_ready[core_id] = finish_time
 
-        logger.info(
-            f"Scheduled task {task.id} on device core {core_id}: start={start_time:.2f}, finish={finish_time:.2f}")
-
     def schedule_edge_task(self, task):
         """Schedule a task for execution on an edge node."""
         # Verify task is assigned to edge
@@ -3043,9 +3034,6 @@ class ThreeTierKernelScheduler:
         # Clear device and cloud execution times
         task.RT_l = task.FT_l = -1
         task.RT_ws = task.FT_ws = task.RT_c = task.FT_c = task.RT_wr = task.FT_wr = -1
-
-        logger.info(f"Scheduled task {task.id} on edge {edge_id}, core {core_id}: " +
-                    f"start={start_time:.2f}, finish={finish_time:.2f}, receive={receive_time:.2f}")
 
     def schedule_cloud_task(self, task):
         """Schedule a task for three-phase execution on the cloud."""
@@ -3118,11 +3106,6 @@ class ThreeTierKernelScheduler:
         self.cloud_upload_ready = upload_finish
         self.cloud_compute_ready = compute_finish
         self.cloud_download_ready = download_finish
-
-        logger.info(f"Scheduled task {task.id} on cloud: " +
-                    f"upload={upload_start:.2f}-{upload_finish:.2f}, " +
-                    f"compute={compute_ready_time:.2f}-{compute_finish:.2f}, " +
-                    f"download={download_ready_time:.2f}-{download_finish:.2f}")
 
     def calculate_device_ready_time(self, task):
         """Calculate ready time for a task on a device core."""
