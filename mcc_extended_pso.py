@@ -15,7 +15,7 @@ from mcc_extended import (
     total_energy_3tier_with_rf, validate_task_dependencies, primary_assignment, task_prioritizing,
     ThreeTierTaskScheduler, SequenceManager
 )
-from utils import format_schedule_3tier
+from utils import format_schedule_3tier, create_and_visualize_task_graph
 
 
 class RobustQScheduler:
@@ -489,18 +489,17 @@ def optimize_with_q_learning(
     return optimized_tasks, optimized_seq_manager
 
 
-# Example usage in context
 if __name__ == "__main__":
 
     # 1) Setup the environment
     upload_rates, download_rates = generate_realistic_network_conditions()
     mobile_power_models = generate_realistic_power_models(device_type='mobile', battery_level=65)
 
-    # 2) Define example tasks (create a simple task graph)
+    # 2) Build DAG graph tasks
     task20 = Task(id=20, succ_task=[])
-    task19 = Task(id=19, succ_task=[])
-    task18 = Task(id=18, succ_task=[])
-    task17 = Task(id=17, succ_task=[])
+    task19 = Task(id=19, succ_task=[task20])
+    task18 = Task(id=18, succ_task=[task20])
+    task17 = Task(id=17, succ_task=[task20])
     task16 = Task(id=16, succ_task=[task19])
     task15 = Task(id=15, succ_task=[task19])
     task14 = Task(id=14, succ_task=[task18, task19])
@@ -515,10 +514,8 @@ if __name__ == "__main__":
     task5 = Task(id=5, succ_task=[task9, task10])
     task4 = Task(id=4, succ_task=[task8, task9])
     task3 = Task(id=3, succ_task=[task7, task8])
-    task2 = Task(id=2, succ_task=[task7, task8])
+    task2 = Task(id=2, succ_task=[task7])
     task1 = Task(id=1, succ_task=[task7])
-
-    # Set predecessors
     task1.pred_tasks = []
     task2.pred_tasks = []
     task3.pred_tasks = []
@@ -538,11 +535,12 @@ if __name__ == "__main__":
     task17.pred_tasks = [task12, task13]
     task18.pred_tasks = [task13, task14]
     task19.pred_tasks = [task14, task15, task16]
-    task20.pred_tasks = [task12]
+    task20.pred_tasks = [task17, task18, task19]
 
-    tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10, task11, task12, task13,
-                        task14, task15, task16, task17, task18, task19, task20]
+    tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10, task11, task12, task13, task14,
+             task15, task16, task17, task18, task19, task20]
     tasks = add_task_attributes(tasks)
+    create_and_visualize_task_graph(tasks, 'graph', ['png'], dpi=600)
 
     print("\nTask Graph Summary:")
     for t in tasks:

@@ -2839,7 +2839,7 @@ if __name__ == "__main__":
     device_power_profiles = mobile_power_models.get('device', {})
     wireless_rf_power_profiles = mobile_power_models.get('rf', {})
 
-    # 3) Build or define your DAG tasks
+    # 3) Build DAG graph tasks
     task20 = Task(id=20, succ_task=[])
     task19 = Task(id=19, succ_task=[])
     task18 = Task(id=18, succ_task=[])
@@ -3044,8 +3044,7 @@ if __name__ == "__main__":
 
                 # Only print tasks that changed
                 if original_tier != optimized_tier or original_resource != optimized_resource:
-                    print(
-                        f"Task {task.id}: {original_tier}({original_resource}) → {optimized_tier}({optimized_resource})")
+                    print(f"Task {task.id}: {original_tier}({original_resource}) → {optimized_tier}({optimized_resource})")
 
         # Validate the optimized schedule
         is_valid, violations = validate_task_dependencies(optimized_tasks)

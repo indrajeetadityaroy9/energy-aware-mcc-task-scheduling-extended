@@ -148,12 +148,7 @@ edge_execution_times = initialize_edge_execution_times()
 ####################################
 # FUNCTION: generate_realistic_power_models
 ####################################
-def generate_realistic_power_models(
-        device_type: str = 'mobile',
-        battery_level: int = 100,
-        num_edge_nodes: int = 2,
-        num_edge_cores: int = 2
-) -> Dict[str, Dict[Any, Any]]:
+def generate_realistic_power_models(device_type: str = 'mobile', battery_level: int = 100, num_edge_nodes: int = 2, num_edge_cores: int = 2) -> Dict[str, Dict[Any, Any]]:
     """
     Generate realistic power consumption models that vary with load for different device types.
 
@@ -313,13 +308,7 @@ def generate_realistic_network_conditions():
     return upload_rates, download_rates
 
 
-def add_task_attributes(
-        predefined_tasks,
-        num_edge_nodes=2,
-        complexity_range=(0.5, 5.0),
-        data_intensity_range=(0.2, 2.0),
-        task_type_weights=None
-):
+def add_task_attributes(predefined_tasks, num_edge_nodes=2, complexity_range=(0.5, 5.0), data_intensity_range=(0.2, 2.0), task_type_weights=None):
     """
     Enhances a predefined task graph with realistic characteristics.
     Only adds attributes without modifying the graph structure.

@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 from data import ExecutionTier, SchedulingState
-
+import networkx as nx
 
 def plot_three_tier_gantt(tasks, scheduler, title="Three-Tier Schedule"):
     # Get basic dimensions from scheduler
@@ -609,3 +609,105 @@ def validate_task_dependencies(tasks, epsilon=1e-9):
     # Finally, if we found no violations, we are good
     is_valid = (len(violations) == 0)
     return is_valid, violations
+
+
+def create_and_visualize_task_graph(nodes, save_path=None, formats=None, dpi=300,show_allocation=False, final_allocation=None):
+    """
+    Creates and visualizes a task graph with color coding for task types and allocation.
+
+    Parameters:
+        nodes: List of Task objects
+        save_path: Path to save the visualization
+        formats: List of file formats to save (e.g., ['png', 'pdf'])
+        dpi: Resolution for raster formats
+        show_allocation: Whether to show the final allocation (device/edge/cloud)
+        final_allocation: Dictionary mapping task IDs to their final allocation
+    """
+    G = nx.DiGraph()
+
+    # Add nodes with attributes
+    for node in nodes:
+        # Store necessary attributes for visualization
+        attributes = {
+            'task_type': node.task_type if hasattr(node, 'task_type') else 'unknown'
+        }
+        G.add_node(node.id, **attributes)
+
+    # Add edges
+    for node in nodes:
+        for child in node.succ_tasks:
+            G.add_edge(node.id, child.id)
+
+    plt.figure(figsize=(12, 14))
+
+    # Use hierarchical layout
+    pos = nx.nx_agraph.graphviz_layout(G, prog='dot', args='-Grankdir=TB')
+
+    # Define colors for task types
+    task_type_colors = {
+        'compute': '#FF9999',  # Red for compute-intensive
+        'data': '#99CCFF',  # Blue for data-intensive
+        'balanced': '#99FF99',  # Green for balanced
+        'unknown': '#DDDDDD'  # Gray for unknown
+    }
+
+    # Define colors and shapes for allocation
+    allocation_colors = {
+        'device': '#FFA500',  # Orange for device
+        'edge': '#800080',  # Purple for edge
+        'cloud': '#00BFFF',  # Sky blue for cloud
+        'unassigned': '#FFFFFF'  # White for unassigned
+    }
+
+    # Assign node colors based on task type or allocation
+    if show_allocation and final_allocation:
+        node_colors = [allocation_colors[G.nodes[n]['allocation']] for n in G.nodes]
+        edge_color = '#666666'  # Darker edges for better contrast
+    else:
+        node_colors = [task_type_colors[G.nodes[n]['task_type']] for n in G.nodes]
+        edge_color = '#333333'
+
+    # Create node labels
+    node_labels = {}
+    for node_id in G.nodes:
+        node_labels[node_id] = str(node_id)
+
+    # Draw network
+    nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=700, alpha=0.9)
+    nx.draw_networkx_edges(G, pos, arrows=True, arrowsize=15, width=1.5, edge_color=edge_color)
+    nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=10, font_weight='bold')
+
+    # Add a legend for task types
+    if not show_allocation or not final_allocation:
+        legend_elements = [
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=10, label=f"{task_type}")
+            for task_type, color in task_type_colors.items() if task_type != 'unknown'
+        ]
+        plt.legend(handles=legend_elements, loc='upper left', title="Task Types")
+    else:
+        # Add a legend for allocation
+        legend_elements = [
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=10, label=f"{alloc}")
+            for alloc, color in allocation_colors.items() if alloc != 'unassigned'
+        ]
+        plt.legend(handles=legend_elements, loc='upper left', title="Allocation")
+
+    plt.title("Task Dependency Graph", fontsize=18, pad=20)
+    plt.axis('off')
+
+    # Save visualization if path is provided
+    if save_path and formats:
+        plt.tight_layout()
+
+        for fmt in formats:
+            full_path = f"{save_path}.{fmt}"
+            try:
+                if fmt in ['pdf', 'svg', 'eps']:
+                    plt.savefig(full_path, format=fmt, bbox_inches='tight', pad_inches=0.1)
+                else:
+                    plt.savefig(full_path, format=fmt, dpi=dpi, bbox_inches='tight', pad_inches=0.1)
+                print(f"Successfully saved visualization as {full_path}")
+            except Exception as e:
+                print(f"Error saving {fmt} format: {str(e)}")
+
+    return plt.gcf()
