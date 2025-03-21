@@ -1037,55 +1037,6 @@ def generate_migration_cache_key(tasks, task_idx, source_unit, target_unit):
 
     return (task_key, source_key, target_key, assignments)
 
-
-def encode_execution_unit(unit: ExecutionUnit) -> Tuple:
-    """
-    Encode an execution unit into a hashable format for caching.
-
-    Args:
-        unit: ExecutionUnit to encode
-
-    Returns:
-        Tuple representation of the execution unit
-    """
-    tier_value = unit.tier.value
-
-    if unit.tier == ExecutionTier.DEVICE:
-        return tier_value, unit.location[0]  # (DEVICE, core_id)
-    elif unit.tier == ExecutionTier.EDGE:
-        return tier_value, unit.location[0], unit.location[1]  # (EDGE, node_id, core_id)
-    else:
-        return (tier_value,)  # (CLOUD,)
-
-
-def encode_task_assignment(task: Any) -> Tuple:
-    """
-    Encode a task assignment into a hashable format for caching.
-
-    Args:
-        task: Task object to encode
-
-    Returns:
-        Tuple representation of the task assignment
-    """
-    if hasattr(task, 'execution_tier'):
-        # Three-tier task
-        tier = task.execution_tier.value
-
-        if task.execution_tier == ExecutionTier.DEVICE:
-            return tier, task.device_core
-        elif task.execution_tier == ExecutionTier.EDGE and task.edge_assignment:
-            return tier, task.edge_assignment.edge_id, task.edge_assignment.core_id
-        else:
-            return (tier,)
-    else:
-        # Original MCC task
-        if hasattr(task, 'is_core_task') and task.is_core_task:
-            return 0, task.assignment  # (DEVICE, core_id)
-        else:
-            return (2,)  # (CLOUD,)
-
-
 class ThreeTierTaskScheduler:
     def __init__(self, tasks, num_cores=3, num_edge_nodes=2, edge_cores_per_node=2,
                  upload_rates=None, download_rates=None):
