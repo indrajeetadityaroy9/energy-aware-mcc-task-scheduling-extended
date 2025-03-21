@@ -7,7 +7,9 @@ import logging
 from math import inf
 import random
 
-from data import ExecutionTier, SchedulingState, core_execution_times, cloud_execution_times, edge_execution_times, generate_realistic_network_conditions, generate_realistic_power_models, add_task_attributes
+from data import ExecutionTier, SchedulingState, core_execution_times, cloud_execution_times, \
+    generate_realistic_network_conditions, generate_realistic_power_models, add_task_attributes, \
+    initialize_edge_execution_times
 from utils import format_schedule_3tier, validate_task_dependencies
 
 # Constants and configuration data
@@ -70,10 +72,6 @@ class Task:
         self.cloud_execution_times = cloud_execution_times
         # Edge execution times (T_i^e,m) - Section III extension
         self.edge_execution_times = {}
-        for key, value in edge_execution_times.items():
-            task_id, edge_id, core_id = key
-            if task_id == id:
-                self.edge_execution_times[(edge_id, core_id)] = value
         # ==== DATA TRANSFER PARAMETERS ====
         # Data sizes for all possible transfers
         self.data_sizes = -1
@@ -121,30 +119,24 @@ class Task:
 
     def get_edge_execution_time(self, edge_id, core_id):
         """Get the execution time for a specific edge node and core"""
-        # Try task-specific edge execution times first
-        key = (self.id, edge_id, core_id)
-        if 'edge_execution_times' in globals() and key in edge_execution_times:
-            return edge_execution_times[key]
-
-        # Next try the task's own execution times dictionary
-        if hasattr(self, 'edge_execution_times'):
-            key = (edge_id, core_id)
-            if key in self.edge_execution_times:
-                return self.edge_execution_times[key]
+        # Try the task's own edge execution times dictionary
+        key = (edge_id, core_id)
+        if hasattr(self, 'edge_execution_times') and key in self.edge_execution_times:
+            return self.edge_execution_times[key]
 
         # Calculate a reasonable fallback based on local execution times
         if hasattr(self, 'local_execution_times') and self.local_execution_times:
-            # For data-intensive tasks (odd IDs), edge is slightly faster
+            # For data-intensive tasks (odd IDs), assume edge is slightly faster
             if self.id % 2 == 1:
                 avg_local = sum(self.local_execution_times) / len(self.local_execution_times)
                 return avg_local * 0.9
-            # For compute-intensive tasks, edge is between device and cloud
+            # For compute-intensive tasks, assume edge performance falls between device and cloud
             else:
                 min_local = min(self.local_execution_times)
                 cloud_time = sum(self.cloud_execution_times)
                 return (min_local + cloud_time) / 2
 
-        # Ultimate fallback
+        # Ultimate fallback if no information is available
         return 5.0
 
     def calculate_data_transfer_time(self, source_tier, target_tier, upload_rates_dict, download_rates_dict,
@@ -2831,11 +2823,14 @@ class ThreeTierKernelScheduler:
 
 
 if __name__ == "__main__":
+    num_edge_nodes = 2
+    num_edge_cores = 2
+
     # 1) Realistic network conditions
     upload_rates, download_rates = generate_realistic_network_conditions()
 
     # 2) Generate mobile power models (which includes 'device' cores and 'rf')
-    mobile_power_models = generate_realistic_power_models(device_type='mobile', battery_level=65)
+    mobile_power_models = generate_realistic_power_models('mobile', 65, 2, 2)
     device_power_profiles = mobile_power_models.get('device', {})
     wireless_rf_power_profiles = mobile_power_models.get('rf', {})
 
@@ -2860,7 +2855,6 @@ if __name__ == "__main__":
     task3 = Task(id=3, succ_task=[task7, task8])
     task2 = Task(id=2, succ_task=[task7, task8])
     task1 = Task(id=1, succ_task=[task7])
-
     # Set predecessors
     task1.pred_tasks = []
     task2.pred_tasks = []
@@ -2887,7 +2881,11 @@ if __name__ == "__main__":
                         task14, task15, task16, task17, task18, task19, task20]
 
     # 4) Enhance tasks with complexity, data sizes, etc.
-    tasks = add_task_attributes(predefined_tasks=predefined_tasks)
+    complexity_range = (0.5, 5.0)
+    data_intensity_range = (0.2, 2.0)
+    task_type_weights = None
+    tasks = add_task_attributes(predefined_tasks, num_edge_nodes, complexity_range, data_intensity_range, task_type_weights)
+    initialize_edge_execution_times(tasks, num_edge_nodes, num_edge_cores)
 
     print("\nTask Graph Summary:")
     for t in tasks:

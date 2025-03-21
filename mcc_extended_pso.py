@@ -491,6 +491,7 @@ def optimize_with_q_learning(
 
 if __name__ == "__main__":
 
+
     # 1) Setup the environment
     upload_rates, download_rates = generate_realistic_network_conditions()
     mobile_power_models = generate_realistic_power_models(device_type='mobile', battery_level=65)
@@ -537,8 +538,8 @@ if __name__ == "__main__":
     task19.pred_tasks = [task14, task15, task16]
     task20.pred_tasks = [task17, task18, task19]
 
-    tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10, task11, task12, task13, task14,
-             task15, task16, task17, task18, task19, task20]
+    tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10,
+             task11, task12, task13, task14, task15, task16, task17, task18, task19, task20]
     tasks = add_task_attributes(tasks)
     create_and_visualize_task_graph(tasks, 'graph', ['png'], dpi=600)
 

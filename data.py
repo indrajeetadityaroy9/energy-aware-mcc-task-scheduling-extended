@@ -41,7 +41,7 @@ cloud_execution_times = [3, 1, 1]
 ####################################
 # FUNCTION: initialize_edge_execution_times
 ####################################
-def initialize_edge_execution_times(tasks=None):
+def initialize_edge_execution_times(tasks, num_edge_nodes, num_edge_cores):
     """
     Compute and return edge execution times for each task (IDs 1 to 20) on available edge nodes and their cores.
 
@@ -60,95 +60,62 @@ def initialize_edge_execution_times(tasks=None):
 
     Parameters:
         tasks (list, optional): List of Task objects that have attributes such as id, type, complexity, and data_intensity.
+        num_edge_nodes (int): The number of available edge nodes.
+        num_edge_cores (int): The number of cores per edge node.
 
     Returns:
         dict: A dictionary with keys (task_id, edge_id, core_id) and values as the computed edge execution times.
     """
-    # Dictionary to store computed edge execution times.
-    edge_execution_times = {}
-
-    # Precompute the total cloud execution time (sum of sending, computing, and receiving times).
-    cloud_time = sum(cloud_execution_times)  # For [3, 1, 1], cloud_time equals 5.
+    cloud_time = sum(cloud_execution_times)  # Example: For [3, 1, 1], cloud_time equals 5.
 
     # Process tasks with IDs 1 to 20.
     for task_id in range(1, 21):
-        # Retrieve local execution times for this task; if not available, use a default list.
         local_times = core_execution_times.get(task_id, [9, 7, 5])
-        min_local = min(local_times)  # Best (minimum) local execution time.
-
-        # Default calculation: average of min_local and cloud_time.
+        min_local = min(local_times)
         base_edge_time = (min_local + cloud_time) / 2.0
 
-        # If task objects are provided, refine base_edge_time using task characteristics.
         task_obj = None
         if tasks is not None:
-            # Find the matching task object using the task ID.
             task_obj = next((t for t in tasks if t.id == task_id), None)
             if task_obj is not None:
-                # Retrieve task type; default to 'balanced' if missing.
                 task_type = getattr(task_obj, 'type', 'balanced').lower()
-                # Retrieve task complexity and data intensity, with default values if not provided.
                 complexity = getattr(task_obj, 'complexity', 3.0)
                 data_intensity = getattr(task_obj, 'data_intensity', 1.0)
 
                 if task_type == 'data':
-                    # Data-intensive tasks: edge is more efficient.
                     base_edge_time = 0.9 * min_local
-                    # If data intensity is above average, reduce time slightly more.
                     adjustment_factor = 1.0 - 0.05 * max(data_intensity - 1.0, 0)
                 elif task_type == 'compute':
-                    # Compute-intensive tasks: average of local and cloud times.
                     base_edge_time = (min_local + cloud_time) / 2.0
-                    # Increase execution time if task complexity is above average.
                     adjustment_factor = 1.0 + 0.05 * max(complexity - 3.0, 0)
                 elif task_type == 'balanced':
-                    # Balanced tasks: slightly favor local performance and average with cloud.
                     base_edge_time = (0.95 * min_local + cloud_time) / 2.0
-                    # Minor adjustment based on difference between complexity and data intensity.
                     adjustment_factor = 1.0 + 0.03 * ((complexity - 3.0) - (data_intensity - 1.0))
                 else:
-                    # For any unknown type, fall back to the default.
                     base_edge_time = (min_local + cloud_time) / 2.0
                     adjustment_factor = 1.0
 
-                # Clamp the adjustment_factor between 0.5 and 1.5 to avoid extreme modifications.
                 adjustment_factor = max(0.5, min(adjustment_factor, 1.5))
-                # Apply the adjustment factor to the base_edge_time.
                 base_edge_time *= adjustment_factor
 
-        # Loop over edge nodes and cores.
-        # (Assumption: 2 edge nodes and 2 cores per node.)
-        for edge_id in range(1, 3):
-            for core_id in range(1, 3):
-                computed_time = base_edge_time  # Start with the computed base time.
-
-                # Apply variability: if it's the second edge node, increase time by 10%.
+        for edge_id in range(1, num_edge_nodes + 1):
+            for core_id in range(1, num_edge_cores + 1):
+                computed_time = base_edge_time
                 if edge_id == 2:
                     computed_time *= 1.1
-                # If it's the second core on a node, increase time by an additional 5%.
                 if core_id == 2:
                     computed_time *= 1.05
 
-                # Save the computed edge execution time for the task on this specific edge node and core.
-                edge_execution_times[(task_id, edge_id, core_id)] = computed_time
-
-                # If Task objects are provided, update the task's attribute with the computed time.
                 if tasks is not None and task_obj is not None:
                     if not hasattr(task_obj, 'edge_execution_times'):
                         task_obj.edge_execution_times = {}
                     task_obj.edge_execution_times[(edge_id, core_id)] = computed_time
 
-    return edge_execution_times
-
-
-# Initialize edge execution times (global variable for later use).
-edge_execution_times = initialize_edge_execution_times()
-
 
 ####################################
 # FUNCTION: generate_realistic_power_models
 ####################################
-def generate_realistic_power_models(device_type: str = 'mobile', battery_level: int = 100, num_edge_nodes: int = 2, num_edge_cores: int = 2) -> Dict[str, Dict[Any, Any]]:
+def generate_realistic_power_models(device_type, battery_level, num_edge_nodes, num_edge_cores) -> Dict[str, Dict[Any, Any]]:
     """
     Generate realistic power consumption models that vary with load for different device types.
 
@@ -308,7 +275,7 @@ def generate_realistic_network_conditions():
     return upload_rates, download_rates
 
 
-def add_task_attributes(predefined_tasks, num_edge_nodes=2, complexity_range=(0.5, 5.0), data_intensity_range=(0.2, 2.0), task_type_weights=None):
+def add_task_attributes(predefined_tasks, num_edge_nodes, complexity_range, data_intensity_range, task_type_weights):
     """
     Enhances a predefined task graph with realistic characteristics.
     Only adds attributes without modifying the graph structure.
@@ -378,8 +345,7 @@ def add_task_attributes(predefined_tasks, num_edge_nodes=2, complexity_range=(0.
                     task.data_sizes[f'edge{i}_to_edge{j}'] = random.uniform(1.0, 3.0)
 
         # Log the enhanced task attributes
-        print(
-            f"Task {task.id}: Type={task.task_type}, " f"Task Complexity={task.complexity:.2f}, Data Intensity={task.data_intensity:.2f}")
+        print(f"Task {task.id}: Type={task.task_type}, " f"Task Complexity={task.complexity:.2f}, Data Intensity={task.data_intensity:.2f}")
 
     return predefined_tasks
 
