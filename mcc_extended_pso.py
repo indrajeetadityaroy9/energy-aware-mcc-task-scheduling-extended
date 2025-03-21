@@ -32,7 +32,7 @@ class RobustQScheduler:
                  max_iterations=500,
                  q_table_path=None,
                  reset_q_table=False,
-                 verbose=True):
+                 verbose=False):
 
         self.alpha = alpha
         self.gamma = gamma
@@ -444,7 +444,7 @@ def optimize_with_q_learning(
         max_episodes=50,
         max_iterations=500,
         reset_q_table=False,
-        verbose=True):
+        verbose=False):
     """
     Optimize task scheduling using robust Q-learning implementation.
 
@@ -544,6 +544,18 @@ if __name__ == "__main__":
                         task14, task15, task16, task17, task18, task19, task20]
     tasks = add_task_attributes(tasks)
 
+    print("\nTask Graph Summary:")
+    for t in tasks:
+        preds = [p.id for p in t.pred_tasks]
+        succs = [s.id for s in t.succ_tasks]
+        task_type = getattr(t, 'task_type', 'unknown')
+        tier_str = t.execution_tier.name if hasattr(t, 'execution_tier') else "UNASSIGNED"
+        print(f"Task {t.id}: Type={task_type}, Tier={tier_str}, "
+              f"C={t.complexity:.2f}, D={t.data_intensity:.2f}")
+        print(f"  Predecessors: {preds} | Successors: {succs}")
+        print("  DataSizes:", t.data_sizes)
+        print()
+
     # 3) Run the initial scheduling algorithm
     primary_assignment(tasks)
     task_prioritizing(tasks)
@@ -568,7 +580,20 @@ if __name__ == "__main__":
         upload_rates=upload_rates
     )
 
+    is_valid, violations = validate_task_dependencies(tasks)
+    if is_valid:
+        print("\nSchedule is valid: no dependency violations.")
+    else:
+        print("\nSchedule has DAG/time violations:")
+        for v in violations:
+            print(f" - {v}")
+
+    schedule_str = format_schedule_3tier(tasks, scheduler)
+    print("\nInitial Formatted schedule:")
+    print(schedule_str)
+
     print(f"Initial time: {initial_time:.2f}, Initial energy: {initial_energy:.2f}")
+
 
     # 5) Create sequence manager
     sequence_manager = SequenceManager(

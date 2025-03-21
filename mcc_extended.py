@@ -2239,7 +2239,7 @@ def construct_sequence(tasks, task_id, source_unit, target_unit, sequence_manage
     sequence_manager.sequences[source_seq_idx] = source_sequence
     sequence_manager.sequences[target_seq_idx] = target_sequence
 
-    logger.info(f"Migrated Task {task_id} from {source_unit} to {target_unit}")
+    #logger.info(f"Migrated Task {task_id} from {source_unit} to {target_unit}")
     return sequence_manager
 
 
