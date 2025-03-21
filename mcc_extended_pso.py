@@ -15,6 +15,7 @@ from mcc_extended import (
     total_energy_3tier_with_rf, validate_task_dependencies, primary_assignment, task_prioritizing,
     ThreeTierTaskScheduler, SequenceManager
 )
+from utils import format_schedule_3tier
 
 
 class RobustQScheduler:
@@ -615,3 +616,6 @@ if __name__ == "__main__":
     if not is_valid:
         for v in violations:
             print(f"  - {v['detail']}")
+    optimized_schedule_str = format_schedule_3tier(optimized_tasks, scheduler)
+    print("\nFormatted optimized schedule:")
+    print(optimized_schedule_str)
