@@ -1,16 +1,15 @@
-import numpy as np
-import random
-from copy import deepcopy
-import time
-import pickle
 import os
+import pickle
+import random
+import time
 from collections import defaultdict
+from copy import deepcopy
 
-from data import generate_realistic_network_conditions, generate_realistic_power_models, add_task_attributes
+from data import generate_realistic_network_conditions, generate_realistic_power_models, add_task_attributes, \
+    initialize_edge_execution_times
 # Import necessary components from mcc_extended.py
 from mcc_extended import (
-    Task, ExecutionTier, SchedulingState,
-    get_current_execution_unit, get_execution_unit_from_index,
+    Task, ExecutionTier, get_current_execution_unit, get_execution_unit_from_index,
     kernel_algorithm_3tier, construct_sequence, total_time_3tier,
     total_energy_3tier_with_rf, validate_task_dependencies, primary_assignment, task_prioritizing,
     ThreeTierTaskScheduler, SequenceManager
@@ -18,9 +17,9 @@ from mcc_extended import (
 from utils import format_schedule_3tier, create_and_visualize_task_graph
 
 
-class RobustQScheduler:
+class QScheduler:
     """
-    Robust Q-learning scheduler that handles Q-table format inconsistencies.
+    Q-learning scheduler that handles Q-table format inconsistencies.
     """
 
     def __init__(self,
@@ -469,7 +468,7 @@ def optimize_with_q_learning(
         Tuple of (optimized_tasks, optimized_sequence_manager)
     """
     # Initialize robust Q-learning scheduler
-    q_scheduler = RobustQScheduler(
+    q_scheduler = QScheduler(
         alpha=learning_rate,
         gamma=discount_factor,
         epsilon=exploration_rate,
@@ -490,57 +489,44 @@ def optimize_with_q_learning(
 
 
 if __name__ == "__main__":
-
+    num_edge_nodes = 2
+    num_edge_cores = 2
 
     # 1) Setup the environment
     upload_rates, download_rates = generate_realistic_network_conditions()
-    mobile_power_models = generate_realistic_power_models(device_type='mobile', battery_level=65)
+    mobile_power_models = generate_realistic_power_models('mobile', 65, 2, 2)
+    device_power_profiles = mobile_power_models.get('device', {})
+    wireless_rf_power_profiles = mobile_power_models.get('rf', {})
 
     # 2) Build DAG graph tasks
-    task20 = Task(id=20, succ_task=[])
-    task19 = Task(id=19, succ_task=[task20])
-    task18 = Task(id=18, succ_task=[task20])
-    task17 = Task(id=17, succ_task=[task20])
-    task16 = Task(id=16, succ_task=[task19])
-    task15 = Task(id=15, succ_task=[task19])
-    task14 = Task(id=14, succ_task=[task18, task19])
-    task13 = Task(id=13, succ_task=[task17, task18])
-    task12 = Task(id=12, succ_task=[task17])
-    task11 = Task(id=11, succ_task=[task15, task16])
-    task10 = Task(id=10, succ_task=[task11, task15])
-    task9 = Task(id=9, succ_task=[task13, task14])
-    task8 = Task(id=8, succ_task=[task12, task13])
-    task7 = Task(id=7, succ_task=[task12])
-    task6 = Task(id=6, succ_task=[task10, task11])
-    task5 = Task(id=5, succ_task=[task9, task10])
-    task4 = Task(id=4, succ_task=[task8, task9])
-    task3 = Task(id=3, succ_task=[task7, task8])
-    task2 = Task(id=2, succ_task=[task7])
-    task1 = Task(id=1, succ_task=[task7])
+    task10 = Task(10)
+    task9 = Task(9, succ_task=[task10])
+    task8 = Task(8, succ_task=[task10])
+    task7 = Task(7, succ_task=[task10])
+    task6 = Task(6, succ_task=[task8])
+    task5 = Task(5, succ_task=[task9])
+    task4 = Task(4, succ_task=[task8, task9])
+    task3 = Task(3, succ_task=[task7])
+    task2 = Task(2, succ_task=[task8, task9])
+    task1 = Task(1, succ_task=[task2, task3, task4, task5, task6])
+    task10.pred_tasks = [task7, task8, task9]
+    task9.pred_tasks = [task2, task4, task5]
+    task8.pred_tasks = [task2, task4, task6]
+    task7.pred_tasks = [task3]
+    task6.pred_tasks = [task1]
+    task5.pred_tasks = [task1]
+    task4.pred_tasks = [task1]
+    task3.pred_tasks = [task1]
+    task2.pred_tasks = [task1]
     task1.pred_tasks = []
-    task2.pred_tasks = []
-    task3.pred_tasks = []
-    task4.pred_tasks = []
-    task5.pred_tasks = []
-    task6.pred_tasks = []
-    task7.pred_tasks = [task1, task2, task3]
-    task8.pred_tasks = [task3, task4]
-    task9.pred_tasks = [task4, task5]
-    task10.pred_tasks = [task5, task6]
-    task11.pred_tasks = [task6, task10]
-    task12.pred_tasks = [task7, task8]
-    task13.pred_tasks = [task8, task9]
-    task14.pred_tasks = [task9, task10]
-    task15.pred_tasks = [task10, task11]
-    task16.pred_tasks = [task11]
-    task17.pred_tasks = [task12, task13]
-    task18.pred_tasks = [task13, task14]
-    task19.pred_tasks = [task14, task15, task16]
-    task20.pred_tasks = [task17, task18, task19]
+    tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10]
 
-    tasks = [task1, task2, task3, task4, task5, task6, task7, task8, task9, task10,
-             task11, task12, task13, task14, task15, task16, task17, task18, task19, task20]
-    tasks = add_task_attributes(tasks)
+    complexity_range = (0.5, 5.0)
+    data_intensity_range = (0.2, 2.0)
+    task_type_weights = None
+    tasks = add_task_attributes(tasks, num_edge_nodes, complexity_range, data_intensity_range, task_type_weights)
+    initialize_edge_execution_times(tasks, num_edge_nodes, num_edge_cores)
+
     create_and_visualize_task_graph(tasks, 'graph', ['png'], dpi=600)
 
     print("\nTask Graph Summary:")
@@ -605,8 +591,8 @@ if __name__ == "__main__":
     T_max = initial_time * 1.2  # Allow 20% increase in completion time
 
     power_models = {
-        'device': mobile_power_models['device'],
-        'rf': mobile_power_models['rf']
+        'device': device_power_profiles,
+        'rf': wireless_rf_power_profiles
     }
 
     optimized_tasks, optimized_seq_manager = optimize_with_q_learning(

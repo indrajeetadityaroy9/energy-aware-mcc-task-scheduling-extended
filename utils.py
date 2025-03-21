@@ -611,18 +611,7 @@ def validate_task_dependencies(tasks, epsilon=1e-9):
     return is_valid, violations
 
 
-def create_and_visualize_task_graph(nodes, save_path=None, formats=None, dpi=300,show_allocation=False, final_allocation=None):
-    """
-    Creates and visualizes a task graph with color coding for task types and allocation.
-
-    Parameters:
-        nodes: List of Task objects
-        save_path: Path to save the visualization
-        formats: List of file formats to save (e.g., ['png', 'pdf'])
-        dpi: Resolution for raster formats
-        show_allocation: Whether to show the final allocation (device/edge/cloud)
-        final_allocation: Dictionary mapping task IDs to their final allocation
-    """
+def create_and_visualize_task_graph(nodes, save_path=None, formats=None, dpi=300, show_allocation=False, final_allocation=None):
     G = nx.DiGraph()
 
     # Add nodes with attributes
@@ -631,12 +620,26 @@ def create_and_visualize_task_graph(nodes, save_path=None, formats=None, dpi=300
         attributes = {
             'task_type': node.task_type if hasattr(node, 'task_type') else 'unknown'
         }
+
+        # Add allocation information if provided
+        if show_allocation and final_allocation and node.id in final_allocation:
+            attributes['allocation'] = final_allocation[node.id]
+        else:
+            attributes['allocation'] = 'unassigned'
+
         G.add_node(node.id, **attributes)
 
-    # Add edges
+    # Add edges - using both successor and predecessor lists to ensure complete graph
+    # First, add all edges from succ_tasks
     for node in nodes:
         for child in node.succ_tasks:
             G.add_edge(node.id, child.id)
+
+    # Then, verify and add any missing edges from pred_tasks
+    for node in nodes:
+        for parent in node.pred_tasks:
+            if not G.has_edge(parent.id, node.id):
+                G.add_edge(parent.id, node.id)
 
     plt.figure(figsize=(12, 14))
 
@@ -651,7 +654,7 @@ def create_and_visualize_task_graph(nodes, save_path=None, formats=None, dpi=300
         'unknown': '#DDDDDD'  # Gray for unknown
     }
 
-    # Define colors and shapes for allocation
+    # Define colors for allocation
     allocation_colors = {
         'device': '#FFA500',  # Orange for device
         'edge': '#800080',  # Purple for edge
