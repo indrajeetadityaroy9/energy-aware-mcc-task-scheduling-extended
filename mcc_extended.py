@@ -294,111 +294,6 @@ class Task:
         logger.error(f"Unknown transfer path from {source_tier} to {target_tier} for task {self.id}")
         return float('inf')  # Effectively prevents this transfer option
 
-    def calculate_edge_ready_time(self, task, edge_id, device_to_edge_ready=None,
-                                  edge_to_edge_ready=None, cloud_to_edge_ready=None,
-                                  upload_rates=None, download_rates=None):
-        """
-        Fixed calculation of ready time for edge execution.
-
-        Parameters:
-            task: The task to calculate ready time for
-            edge_id: Edge node ID (0-based)
-            device_to_edge_ready: Dictionary of device to edge channel readiness times
-            edge_to_edge_ready: Matrix of edge to edge channel readiness times
-            cloud_to_edge_ready: Dictionary of cloud to edge channel readiness times
-            upload_rates: Dictionary of upload rates for different channels
-            download_rates: Dictionary of download rates for different channels
-        """
-        if not task.pred_tasks:
-            return 0  # Entry task
-
-        # Default values if not provided
-        device_to_edge_ready = device_to_edge_ready or {}
-        edge_to_edge_ready = edge_to_edge_ready or [[0 for _ in range(10)] for _ in range(10)]
-        cloud_to_edge_ready = cloud_to_edge_ready or {}
-        upload_rates = upload_rates or {}
-        download_rates = download_rates or {}
-
-        max_ready_time = 0
-
-        for pred_task in task.pred_tasks:
-            # Skip unscheduled predecessors
-            if pred_task.is_scheduled != SchedulingState.SCHEDULED:
-                return float('inf')
-
-            # Calculate ready time based on predecessor location
-            if pred_task.execution_tier == ExecutionTier.DEVICE:
-                # Predecessor on device, need device→edge transfer
-                pred_finish = pred_task.FT_l
-
-                # Add device→edge transfer time
-                data_key = f'device_to_edge{edge_id + 1}'
-                data_size = task.data_sizes.get(data_key, 0)
-                rate = upload_rates.get(data_key, 1.0)
-
-                # Check channel availability and calculate transfer time
-                channel_available = device_to_edge_ready.get(edge_id, 0)
-                transfer_start = max(pred_finish, channel_available)
-                transfer_time = data_size / rate if rate > 0 else 0
-                ready_time = transfer_start + transfer_time
-
-            elif pred_task.execution_tier == ExecutionTier.EDGE:
-                # Predecessor on some edge node
-                if not pred_task.edge_assignment:
-                    return float('inf')
-
-                pred_edge_id = pred_task.edge_assignment.edge_id - 1
-
-                if pred_edge_id == edge_id:
-                    # Same edge node - core-to-core time might be needed
-                    core_id = pred_task.edge_assignment.core_id - 1
-                    ready_time = pred_task.FT_edge.get(pred_edge_id, float('inf'))
-
-                    # Add small core-to-core transfer time if different cores
-                    if task.edge_assignment and task.edge_assignment.core_id - 1 != core_id:
-                        ready_time += 0.1  # Small overhead for core-to-core transfer
-                else:
-                    # Different edge - need edge-to-edge transfer
-                    if pred_edge_id not in pred_task.FT_edge:
-                        return float('inf')
-
-                    pred_finish = pred_task.FT_edge[pred_edge_id]
-
-                    # Calculate edge-to-edge transfer time
-                    data_key = f'edge{pred_edge_id + 1}_to_edge{edge_id + 1}'
-                    data_size = task.data_sizes.get(data_key, 0)
-                    rate = upload_rates.get(data_key, 1.0)
-
-                    # Check edge-to-edge channel availability
-                    channel_available = edge_to_edge_ready[pred_edge_id][edge_id]
-                    transfer_start = max(pred_finish, channel_available)
-                    transfer_time = data_size / rate if rate > 0 else 0
-                    ready_time = transfer_start + transfer_time
-
-            elif pred_task.execution_tier == ExecutionTier.CLOUD:
-                # Cloud to edge transfer
-                pred_finish = pred_task.FT_c
-
-                # Add cloud-to-edge transfer time
-                data_key = f'cloud_to_edge{edge_id + 1}'
-                data_size = task.data_sizes.get(data_key, 0)
-                rate = download_rates.get(data_key, 1.0)
-
-                # Check channel availability
-                channel_available = cloud_to_edge_ready.get(edge_id, 0)
-                transfer_start = max(pred_finish, channel_available)
-                transfer_time = data_size / rate if rate > 0 else 0
-                ready_time = transfer_start + transfer_time
-            else:
-                return float('inf')
-
-            max_ready_time = max(max_ready_time, ready_time)
-
-        # Also consider the device-to-edge channel availability
-        max_ready_time = max(max_ready_time, device_to_edge_ready.get(edge_id, 0))
-
-        return max_ready_time
-
     def calculate_ready_time_cloud_upload(self, download_rates):
         if not self.pred_tasks:
             return 0  # Entry task, ready at time 0
@@ -1037,6 +932,7 @@ def generate_migration_cache_key(tasks, task_idx, source_unit, target_unit):
 
     return (task_key, source_key, target_key, assignments)
 
+
 class ThreeTierTaskScheduler:
     def __init__(self, tasks, num_cores=3, num_edge_nodes=2, edge_cores_per_node=2,
                  upload_rates=None, download_rates=None):
@@ -1074,7 +970,7 @@ class ThreeTierTaskScheduler:
         total_resources = self.k + self.M * self.edge_cores + 1
         self.sequences = [[] for _ in range(total_resources)]
 
-        # NEW: A place to record the final “minimal-delay” schedule decisions
+        # NEW: A place to record the final "minimal-delay" schedule decisions
         # so you have an explicit dictionary of {task_id: {...}}
         self.final_min_delay_schedule = {}
 
@@ -1125,14 +1021,14 @@ class ThreeTierTaskScheduler:
                 # Some predecessor not done or not scheduled properly
                 continue
 
-                # Find earliest finish among all resources
+            # Find earliest finish among all resources
             best_finish, best_option = self.find_earliest_finish_among_all_resources(task, pred_finish)
 
             # Schedule the task
             if best_option is None or best_finish == float('inf'):
                 continue
 
-                # Execute the schedule decision
+            # Execute the schedule decision
             self.execute_schedule_decision(task, pred_finish, best_finish, best_option)
 
             # With task scheduled, reduce in-degree of successors
@@ -1179,7 +1075,11 @@ class ThreeTierTaskScheduler:
         # 2) Check edge nodes
         for e_id in range(self.M):
             # Calculate earliest time the task can start on that edge
-            start_time = max(pred_finish, self.calculate_edge_ready_time(task, e_id))
+            # We need to calculate edge ready time for each edge node individually
+            # and make sure we use this per-edge ready time instead of the global pred_finish
+            edge_ready_time = self.calculate_edge_ready_time(task, e_id)
+            start_time = edge_ready_time  # Use edge-specific ready time, not global pred_finish
+
             # Among that edge's cores, pick the earliest finishing core
             chosen_finish, chosen_core = self.find_best_edge_core(task, e_id, start_time)
             if chosen_finish < best_finish_time:
@@ -1201,11 +1101,11 @@ class ThreeTierTaskScheduler:
         Among the edge_id's cores, find which yields the earliest finish time.
         Return (finish_time, core_id).
         """
-        best_finish = inf
+        best_finish = float('inf')
         best_core = None
         for core_id in range(self.edge_cores):
             actual_start = max(start_time, self.edge_core_earliest_ready[edge_id][core_id])
-            exec_time = task.get_edge_execution_time(edge_id + 1, core_id + 1) or inf
+            exec_time = task.get_edge_execution_time(edge_id + 1, core_id + 1) or float('inf')
             finish_time = actual_start + exec_time
             if finish_time < best_finish:
                 best_finish = finish_time
@@ -1223,7 +1123,8 @@ class ThreeTierTaskScheduler:
         start time in task.execution_unit_task_start_times so that later
         formatting/logging can display the correct time (rather than 0.0).
 
-        For edge tasks, properly calculates and records edge-to-device transfer times.
+        For edge tasks, properly calculates and records edge-to-device transfer times
+        and edge-to-edge transfer times.
         """
         resource_kind = best_option[0]
 
@@ -1306,6 +1207,35 @@ class ThreeTierTaskScheduler:
             # Update channel readiness
             self.edge_to_device_ready[e_id] = receive_time
 
+            # ---- Precompute all potential edge-to-edge transfers ----
+            # Initialize tracking for edge-to-edge transfers
+            if not hasattr(task, 'FT_edge_send'):
+                task.FT_edge_send = {}
+
+            # Reserve times on all potential edge-to-edge channels from this edge
+            for target_e_id in range(self.M):
+                if target_e_id != e_id:  # Skip self-transfers
+                    # Calculate when this task's data would be available to other edges
+                    edge_to_edge_key = f'edge{e_id + 1}_to_edge{target_e_id + 1}'
+                    data_size = task.data_sizes.get(edge_to_edge_key, 1.0)
+                    rate = self.upload_rates.get(edge_to_edge_key, 1.0)
+
+                    # Potential transfer could start after task finishes
+                    potential_transfer_start = max(finish_time, self.edge_to_edge_ready[e_id][target_e_id])
+                    transfer_time = data_size / rate if rate > 0 else 0
+                    potential_transfer_finish = potential_transfer_start + transfer_time
+
+                    # Record this potential transfer time
+                    task.FT_edge_send[(e_id, target_e_id)] = potential_transfer_finish
+
+                    # Update the edge-to-edge channel availability
+                    self.edge_to_edge_ready[e_id][target_e_id] = potential_transfer_finish
+
+                    logger.debug(
+                        f"Potential edge-to-edge: Task {task.id} Edge{e_id + 1}→Edge{target_e_id + 1} "
+                        f"would be available at {potential_transfer_finish:.3f}"
+                    )
+
             # Make sure execution_unit_task_start_times is large enough
             total_units = self.k + self.M * self.edge_cores + 1
             if (not hasattr(task, 'execution_unit_task_start_times') or
@@ -1374,7 +1304,7 @@ class ThreeTierTaskScheduler:
         """
         For strict precedence, a task can't start until all predecessors are done.
         Return the max finish time among all of task's predecessors,
-        properly accounting for edge-to-device transfer times.
+        properly accounting for edge-to-device and edge-to-edge transfer times.
         """
         if not task.pred_tasks:
             return 0.0
@@ -1388,44 +1318,128 @@ class ThreeTierTaskScheduler:
             # Determine when this predecessor's results are available based on tier
             if pred.execution_tier == ExecutionTier.DEVICE:
                 # Local task - available as soon as it finishes
-                pred_finish = pred.FT_l
+                pred_finish = getattr(pred, 'FT_l', 0.0)
 
             elif pred.execution_tier == ExecutionTier.CLOUD:
                 # Cloud task - results available after download
-                pred_finish = pred.FT_wr
+                pred_finish = getattr(pred, 'FT_wr', 0.0)
 
             elif pred.execution_tier == ExecutionTier.EDGE:
-                # Edge task - must wait for edge-to-device transfer
+                # Edge task handling depends on the destination tier
                 if not pred.edge_assignment:
                     logger.warning(f"Edge assignment missing for predecessor {pred.id}")
                     return float('inf')
 
-                edge_id = pred.edge_assignment.edge_id - 1  # 0-based index
+                pred_edge_id = pred.edge_assignment.edge_id - 1  # 0-based index
 
-                # Check if edge-to-device transfer time is recorded
-                if hasattr(pred, 'FT_edge_receive') and edge_id in pred.FT_edge_receive:
-                    pred_finish = pred.FT_edge_receive[edge_id]
-                else:
-                    # If not recorded, calculate it now
-                    if not hasattr(pred, 'FT_edge') or edge_id not in pred.FT_edge:
+                # Determine the target execution location for the current task
+                if task.execution_tier == ExecutionTier.DEVICE:
+                    # Edge -> Device transfer
+                    if hasattr(pred, 'FT_edge_receive') and pred_edge_id in pred.FT_edge_receive:
+                        pred_finish = pred.FT_edge_receive[pred_edge_id]
+                    else:
+                        # If not recorded, calculate it now
+                        if not hasattr(pred, 'FT_edge') or pred_edge_id not in pred.FT_edge:
+                            logger.warning(f"Missing edge finish time for predecessor {pred.id}")
+                            return float('inf')
+
+                        edge_finish = pred.FT_edge[pred_edge_id]
+                        edge_to_device_key = f'edge{pred_edge_id + 1}_to_device'
+                        data_size = pred.data_sizes.get(edge_to_device_key, 1.0)
+                        download_rate = self.download_rates.get(edge_to_device_key, 1.0)
+                        transfer_time = data_size / download_rate if download_rate > 0 else 0
+
+                        # Account for channel contention
+                        if hasattr(self, 'edge_to_device_ready'):
+                            transfer_start = max(edge_finish, self.edge_to_device_ready[pred_edge_id])
+                            pred_finish = transfer_start + transfer_time
+                        else:
+                            pred_finish = edge_finish + transfer_time
+
+                elif task.execution_tier == ExecutionTier.EDGE:
+                    # First check if the current task is assigned to an edge
+                    if not task.edge_assignment:
+                        logger.warning(f"Edge assignment missing for task {task.id}")
+                        return float('inf')
+
+                    task_edge_id = task.edge_assignment.edge_id - 1
+
+                    if pred_edge_id == task_edge_id:
+                        # Same edge node - core-to-core communication only
+                        pred_finish = pred.FT_edge.get(pred_edge_id, float('inf'))
+
+                        # Add minor delay for core-to-core transfer if on different cores
+                        if task.edge_assignment.core_id != pred.edge_assignment.core_id:
+                            pred_finish += 0.1  # Small overhead for core-to-core
+                    else:
+                        # Different edge nodes - need edge-to-edge transfer
+                        if not hasattr(pred, 'FT_edge') or pred_edge_id not in pred.FT_edge:
+                            logger.warning(f"Missing edge finish time for predecessor {pred.id}")
+                            return float('inf')
+
+                        # Check if a pre-calculated edge-to-edge transfer exists
+                        transfer_key = (pred_edge_id, task_edge_id)
+                        if hasattr(pred, 'FT_edge_send') and transfer_key in pred.FT_edge_send:
+                            # Use pre-calculated time
+                            pred_finish = pred.FT_edge_send[transfer_key]
+                            logger.info(f"Using pre-calculated edge-to-edge transfer: "
+                                        f"Task {pred.id}→{task.id}, "
+                                        f"Edge {pred_edge_id + 1}→{task_edge_id + 1}, "
+                                        f"Finish: {pred_finish:.3f}")
+                        else:
+                            # Calculate edge-to-edge transfer time
+                            edge_finish = pred.FT_edge[pred_edge_id]
+
+                            data_key = f'edge{pred_edge_id + 1}_to_edge{task_edge_id + 1}'
+                            data_size = pred.data_sizes.get(data_key, 1.0)
+                            transfer_rate = self.upload_rates.get(data_key, 1.0)
+                            transfer_time = data_size / transfer_rate if transfer_rate > 0 else 0
+
+                            # Account for channel contention
+                            if hasattr(self, 'edge_to_edge_ready'):
+                                transfer_start = max(edge_finish, self.edge_to_edge_ready[pred_edge_id][task_edge_id])
+                                transfer_end = transfer_start + transfer_time
+
+                                # Update channel availability (this is crucial)
+                                self.edge_to_edge_ready[pred_edge_id][task_edge_id] = transfer_end
+                                pred_finish = transfer_end
+
+                                # Store calculated time for reuse
+                                if not hasattr(pred, 'FT_edge_send'):
+                                    pred.FT_edge_send = {}
+                                pred.FT_edge_send[transfer_key] = transfer_end
+
+                                logger.info(f"Calculated edge-to-edge transfer: "
+                                            f"Task {pred.id}→{task.id}, "
+                                            f"Edge {pred_edge_id + 1}→{task_edge_id + 1}, "
+                                            f"Start: {transfer_start:.3f}, "
+                                            f"End: {transfer_end:.3f}")
+                            else:
+                                # Simple calculation without contention tracking
+                                pred_finish = edge_finish + transfer_time
+
+                elif task.execution_tier == ExecutionTier.CLOUD:
+                    # Edge -> Cloud transfer needed
+                    if not hasattr(pred, 'FT_edge') or pred_edge_id not in pred.FT_edge:
                         logger.warning(f"Missing edge finish time for predecessor {pred.id}")
                         return float('inf')
 
-                    edge_finish = pred.FT_edge[edge_id]
-                    edge_to_device_key = f'edge{edge_id + 1}_to_device'
-                    data_size = pred.data_sizes.get(edge_to_device_key, 1.0)
-                    download_rate = self.download_rates.get(edge_to_device_key, 1.0)
-                    transfer_time = data_size / download_rate if download_rate > 0 else 0
+                    edge_finish = pred.FT_edge[pred_edge_id]
+                    data_key = f'edge{pred_edge_id + 1}_to_cloud'
+                    data_size = pred.data_sizes.get(data_key, 1.0)
+                    upload_rate = self.upload_rates.get(data_key, 1.0)
+                    transfer_time = data_size / upload_rate if upload_rate > 0 else 0
 
-                    # Store calculated time for future reference
-                    if not hasattr(pred, 'FT_edge_receive'):
-                        pred.FT_edge_receive = {}
+                    # Account for channel contention
+                    if hasattr(self, 'edge_to_cloud_ready'):
+                        transfer_start = max(edge_finish, self.edge_to_cloud_ready[pred_edge_id])
+                        transfer_end = transfer_start + transfer_time
 
-                    pred_finish = edge_finish + transfer_time
-                    pred.FT_edge_receive[edge_id] = pred_finish
-
-                    logger.info(
-                        f"Calculated result arrival time for task {pred.id}: edge finish {edge_finish:.2f} + transfer {transfer_time:.2f} = {pred_finish:.2f}")
+                        # Update channel availability
+                        self.edge_to_cloud_ready[pred_edge_id] = transfer_end
+                        pred_finish = transfer_end
+                    else:
+                        pred_finish = edge_finish + transfer_time
             else:
                 logger.error(f"Unknown execution tier for predecessor {pred.id}")
                 return float('inf')
@@ -1443,8 +1457,8 @@ class ThreeTierTaskScheduler:
     # -------------------------------------------------------------------------
     def calculate_cloud_upload_ready_time(self, task):
         # For a single channel, you might just require we wait for ws_ready
-        # plus the predecessor’s finish. If you want “infinite concurrency,”
-        # you’d skip the shared ws_ready. For now we do:
+        # plus the predecessor's finish. If you want "infinite concurrency,"
+        # you'd skip the shared ws_ready. For now we do:
         return max(self.ws_ready, self.earliest_pred_finish_time(task))
 
     # -------------------------------------------------------------------------
@@ -1452,23 +1466,136 @@ class ThreeTierTaskScheduler:
     # -------------------------------------------------------------------------
     def get_cloud_finish(self, task, upload_start):
         t_send, t_cloud, t_recv = task.cloud_execution_times
-        # If you assume unlimited concurrency in the cloud, it’s just:
+        # If you assume unlimited concurrency in the cloud, it's just:
         return upload_start + t_send + t_cloud + t_recv
 
     # -------------------------------------------------------------------------
     #   Helper: earliest time a task can start on edge e_id
     # -------------------------------------------------------------------------
-    def calculate_edge_ready_time(self, task, e_id):
-        # In the simplest approach, you look at each predecessor’s finish time
-        # plus data transfer from that predecessor’s location to this edge.
-        # This code is a placeholder that you may refine:
-        pred_finish = self.earliest_pred_finish_time(task)
-        # If you also track e.g. device->edge or edge->edge readiness, do:
-        # e.g. return max(pred_finish, self.device_to_edge_ready[e_id])
-        return max(pred_finish, self.device_to_edge_ready[e_id])
+    def calculate_edge_ready_time(self, task, edge_id):
+        """
+        Revised calculation of the ready time for executing 'task' on a given edge node (0-based index edge_id)
+        without caching. This method computes, for each predecessor of the task, the time at which its output is
+        available on the target edge node by considering:
+
+          - DEVICE → EDGE transfers,
+          - EDGE → EDGE transfers (for a predecessor on a different edge),
+          - CLOUD → EDGE transfers.
+
+        For EDGE → EDGE transfers, the channel's availability is updated using the maximum of its current value
+        and the newly computed transfer finish time.
+
+        Parameters:
+          task: The task for which to compute the ready time.
+          edge_id: The 0-based index of the target edge node.
+
+        Returns:
+          float: The earliest time at which 'task' can start on edge 'edge_id'.
+        """
+        if not task.pred_tasks:
+            return 0.0  # Entry task has no predecessors
+
+        max_ready_time = 0.0
+
+        for pred_task in task.pred_tasks:
+            # If any predecessor is unscheduled, we cannot compute a valid ready time.
+            if pred_task.is_scheduled != SchedulingState.SCHEDULED or not hasattr(pred_task, 'execution_finish_time'):
+                logger.warning(f"Predecessor task {pred_task.id} of task {task.id} not scheduled")
+                return float('inf')
+
+            # Initialize ready_time for this predecessor.
+            ready_time = 0.0
+
+            if pred_task.execution_tier == ExecutionTier.DEVICE:
+                # DEVICE → EDGE transfer:
+                pred_finish = pred_task.FT_l
+                if pred_finish <= 0:
+                    logger.warning(f"Invalid finish time for DEVICE predecessor {pred_task.id}")
+                    return float('inf')
+                data_key = f'device_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0)
+                rate = self.upload_rates.get(data_key, 1.0)
+                channel_avail = self.device_to_edge_ready[edge_id]
+                transfer_start = max(pred_finish, channel_avail)
+                transfer_time = data_size / rate if rate > 0 else 0
+                ready_time = transfer_start + transfer_time
+                # Update the device-to-edge channel availability.
+                self.device_to_edge_ready[edge_id] = ready_time
+
+            elif pred_task.execution_tier == ExecutionTier.EDGE:
+                # EDGE → EDGE transfer:
+                if not pred_task.edge_assignment:
+                    logger.warning(f"Edge assignment missing for EDGE predecessor {pred_task.id}")
+                    return float('inf')
+                pred_edge_id = pred_task.edge_assignment.edge_id - 1  # Convert to 0-based index
+
+                if pred_edge_id == edge_id:
+                    # Predecessor is on the same edge:
+                    if pred_edge_id not in pred_task.FT_edge:
+                        logger.warning(f"Missing FT_edge[{pred_edge_id}] for predecessor {pred_task.id}")
+                        return float('inf')
+                    ready_time = pred_task.FT_edge[pred_edge_id]
+                    # Add a small overhead if the child is assigned to a different core.
+                    if task.edge_assignment and (task.edge_assignment.core_id != pred_task.edge_assignment.core_id):
+                        ready_time += 0.1
+                else:
+                    # Predecessor is on a different edge: compute EDGE → EDGE transfer delay.
+                    if pred_edge_id not in pred_task.FT_edge:
+                        logger.warning(f"Missing FT_edge[{pred_edge_id}] for EDGE predecessor {pred_task.id}")
+                        return float('inf')
+                    data_key = f'edge{pred_edge_id + 1}_to_edge{edge_id + 1}'
+                    data_size = task.data_sizes.get(data_key, 0)
+                    rate = self.upload_rates.get(data_key, 1.0)
+                    current_channel_avail = self.edge_to_edge_ready[pred_edge_id][edge_id]
+                    pred_finish = pred_task.FT_edge[pred_edge_id]
+                    transfer_start = max(pred_finish, current_channel_avail)
+                    transfer_time = data_size / rate if rate > 0 else 0
+                    new_ready_time = transfer_start + transfer_time
+                    # Robustly update the channel availability using max().
+                    self.edge_to_edge_ready[pred_edge_id][edge_id] = max(current_channel_avail, new_ready_time)
+                    ready_time = self.edge_to_edge_ready[pred_edge_id][edge_id]
+                    # Optionally, record the computed transfer time for reuse.
+                    if not hasattr(pred_task, 'FT_edge_send'):
+                        pred_task.FT_edge_send = {}
+                    pred_task.FT_edge_send[(pred_edge_id, edge_id)] = ready_time
+                    logger.info(f"Calculated EDGE→EDGE transfer: Task {pred_task.id}→Task {task.id}, "
+                                f"from Edge {pred_edge_id + 1} to Edge {edge_id + 1}, "
+                                f"transfer start {transfer_start:.3f}, delay {transfer_time:.3f}, ready at {ready_time:.3f}")
+
+            elif pred_task.execution_tier == ExecutionTier.CLOUD:
+                # CLOUD → EDGE transfer:
+                pred_finish = pred_task.FT_c
+                if pred_finish <= 0:
+                    logger.warning(f"Invalid finish time for CLOUD predecessor {pred_task.id}")
+                    return float('inf')
+                data_key = f'cloud_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0)
+                rate = self.download_rates.get(data_key, 1.0)
+                channel_avail = self.cloud_to_edge_ready[edge_id]
+                transfer_start = max(pred_finish, channel_avail)
+                transfer_time = data_size / rate if rate > 0 else 0
+                ready_time = transfer_start + transfer_time
+                # Update the cloud-to-edge channel availability.
+                self.cloud_to_edge_ready[edge_id] = ready_time
+
+            else:
+                logger.error(f"Unknown execution tier for predecessor {pred_task.id}")
+                return float('inf')
+
+            # Sanity check for ready_time.
+            if ready_time <= 0:
+                logger.warning(f"Computed non-positive ready time for predecessor {pred_task.id}: {ready_time}")
+                return float('inf')
+
+            max_ready_time = max(max_ready_time, ready_time)
+
+        # Also ensure that the device-to-edge channel's current state is considered.
+        max_ready_time = max(max_ready_time, self.device_to_edge_ready[edge_id])
+        logger.debug(f"Task {task.id} computed ready time on EDGE {edge_id + 1}: {max_ready_time:.3f}")
+        return max_ready_time
 
     # -------------------------------------------------------------------------
-    #   3) Record the Final “Minimal-Delay” Schedule
+    #   3) Record the Final "Minimal-Delay" Schedule
     # -------------------------------------------------------------------------
     def record_final_schedule(self):
         """
@@ -2409,6 +2536,82 @@ class ThreeTierKernelScheduler:
 
                 break  # Found the sequence containing this task
 
+    def calculate_edge_ready_time(self, task, edge_id):
+        """Calculate ready time for a task on an edge node."""
+        if not task.pred_tasks:
+            return 0.0  # Entry task
+
+        max_ready_time = 0.0
+
+        for pred in task.pred_tasks:
+            # Base time when predecessor completes its execution
+            if pred.execution_tier == ExecutionTier.DEVICE:
+                # Device -> Edge transfer needed
+                pred_complete = pred.FT_l
+
+                # Add device->edge transfer time
+                data_key = f'device_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0.0)
+                rate = self.upload_rates.get(data_key, 1.0)
+
+                # Account for channel contention
+                transfer_start = max(pred_complete, self.device_to_edge_ready[edge_id])
+                transfer_time = data_size / rate if rate > 0 else 0.0
+                pred_finish = transfer_start + transfer_time
+
+                # Update channel availability
+                self.device_to_edge_ready[edge_id] = pred_finish
+
+            elif pred.execution_tier == ExecutionTier.CLOUD:
+                # Cloud -> Edge transfer needed
+                pred_complete = pred.FT_c
+
+                # Add cloud->edge transfer time
+                data_key = f'cloud_to_edge{edge_id + 1}'
+                data_size = task.data_sizes.get(data_key, 0.0)
+                rate = self.download_rates.get(data_key, 1.0)
+
+                # Account for channel contention
+                transfer_start = max(pred_complete, self.cloud_to_edge_ready[edge_id])
+                transfer_time = data_size / rate if rate > 0 else 0.0
+                pred_finish = transfer_start + transfer_time
+
+                # Update channel availability
+                self.cloud_to_edge_ready[edge_id] = pred_finish
+
+            elif pred.execution_tier == ExecutionTier.EDGE:
+                if not pred.edge_assignment:
+                    pred_finish = 0.0
+                    continue
+
+                pred_edge_id = pred.edge_assignment.edge_id - 1
+
+                if pred_edge_id == edge_id:
+                    # Same edge node - no transfer needed
+                    pred_finish = pred.FT_edge.get(pred_edge_id, 0.0)
+                else:
+                    # Different edge node - edge->edge transfer needed
+                    pred_complete = pred.FT_edge.get(pred_edge_id, 0.0)
+
+                    # Add edge->edge transfer time
+                    data_key = f'edge{pred_edge_id + 1}_to_edge{edge_id + 1}'
+                    data_size = task.data_sizes.get(data_key, 0.0)
+                    rate = self.upload_rates.get(data_key, 1.0)
+
+                    # Account for channel contention
+                    transfer_start = max(pred_complete, self.edge_to_edge_ready[pred_edge_id][edge_id])
+                    transfer_time = data_size / rate if rate > 0 else 0.0
+                    pred_finish = transfer_start + transfer_time
+
+                    # Update channel availability
+                    self.edge_to_edge_ready[pred_edge_id][edge_id] = pred_finish
+            else:
+                pred_finish = 0.0
+
+            max_ready_time = max(max_ready_time, pred_finish)
+
+        return max_ready_time
+
     def is_task_ready(self, task):
         """Check if a task is ready for scheduling."""
         return (self.dependency_ready[task.id] == 0 and
@@ -2621,82 +2824,6 @@ class ThreeTierKernelScheduler:
                     else:
                         # Fallback to edge execution finish time
                         pred_finish = pred.FT_edge.get(edge_id, 0.0)
-
-            max_ready_time = max(max_ready_time, pred_finish)
-
-        return max_ready_time
-
-    def calculate_edge_ready_time(self, task, edge_id):
-        """Calculate ready time for a task on an edge node."""
-        if not task.pred_tasks:
-            return 0.0  # Entry task
-
-        max_ready_time = 0.0
-
-        for pred in task.pred_tasks:
-            # Base time when predecessor completes its execution
-            if pred.execution_tier == ExecutionTier.DEVICE:
-                # Device -> Edge transfer needed
-                pred_complete = pred.FT_l
-
-                # Add device->edge transfer time
-                data_key = f'device_to_edge{edge_id + 1}'
-                data_size = task.data_sizes.get(data_key, 0.0)
-                rate = self.upload_rates.get(data_key, 1.0)
-
-                # Account for channel contention
-                transfer_start = max(pred_complete, self.device_to_edge_ready[edge_id])
-                transfer_time = data_size / rate if rate > 0 else 0.0
-                pred_finish = transfer_start + transfer_time
-
-                # Update channel availability
-                self.device_to_edge_ready[edge_id] = pred_finish
-
-            elif pred.execution_tier == ExecutionTier.CLOUD:
-                # Cloud -> Edge transfer needed
-                pred_complete = pred.FT_c
-
-                # Add cloud->edge transfer time
-                data_key = f'cloud_to_edge{edge_id + 1}'
-                data_size = task.data_sizes.get(data_key, 0.0)
-                rate = self.download_rates.get(data_key, 1.0)
-
-                # Account for channel contention
-                transfer_start = max(pred_complete, self.cloud_to_edge_ready[edge_id])
-                transfer_time = data_size / rate if rate > 0 else 0.0
-                pred_finish = transfer_start + transfer_time
-
-                # Update channel availability
-                self.cloud_to_edge_ready[edge_id] = pred_finish
-
-            elif pred.execution_tier == ExecutionTier.EDGE:
-                if not pred.edge_assignment:
-                    pred_finish = 0.0
-                    continue
-
-                pred_edge_id = pred.edge_assignment.edge_id - 1
-
-                if pred_edge_id == edge_id:
-                    # Same edge node - no transfer needed
-                    pred_finish = pred.FT_edge.get(pred_edge_id, 0.0)
-                else:
-                    # Different edge node - edge->edge transfer needed
-                    pred_complete = pred.FT_edge.get(pred_edge_id, 0.0)
-
-                    # Add edge->edge transfer time
-                    data_key = f'edge{pred_edge_id + 1}_to_edge{edge_id + 1}'
-                    data_size = task.data_sizes.get(data_key, 0.0)
-                    rate = self.upload_rates.get(data_key, 1.0)
-
-                    # Account for channel contention
-                    transfer_start = max(pred_complete, self.edge_to_edge_ready[pred_edge_id][edge_id])
-                    transfer_time = data_size / rate if rate > 0 else 0.0
-                    pred_finish = transfer_start + transfer_time
-
-                    # Update channel availability
-                    self.edge_to_edge_ready[pred_edge_id][edge_id] = pred_finish
-            else:
-                pred_finish = 0.0
 
             max_ready_time = max(max_ready_time, pred_finish)
 
