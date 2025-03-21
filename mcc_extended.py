@@ -54,31 +54,6 @@ class TaskMigrationState:
     # Migration characteristics
     migration_complexity: int = 0  # Measure of migration complexity
 
-    def __post_init__(self):
-        """Calculate derived metrics after initialization"""
-        # Set migration complexity based on source and target tiers
-        if self.source_tier == self.target_tier:
-            if self.source_tier == ExecutionTier.DEVICE:
-                # Device to different device core
-                self.migration_complexity = 1
-            elif self.source_tier == ExecutionTier.EDGE:
-                # Edge to different edge
-                if self.source_location and self.target_location and self.source_location[0] == self.target_location[0]:
-                    # Same edge node, different core
-                    self.migration_complexity = 1
-                else:
-                    # Different edge nodes
-                    self.migration_complexity = 2
-            else:
-                # Cloud to cloud (shouldn't happen)
-                self.migration_complexity = 0
-        else:
-            # Cross-tier migration
-            src_idx = self.source_tier.value
-            tgt_idx = self.target_tier.value
-            # Set complexity based on distance between tiers
-            self.migration_complexity = 1 + abs(src_idx - tgt_idx)
-
 
 class Task:
     def __init__(self, id, pred_task=None, succ_task=None, complexity=None, data_intensity=None):
@@ -143,31 +118,6 @@ class Task:
         self.execution_unit_task_start_times = None  # Will be set during scheduling
         self.edge_assignment = None
         self.device_core = -1
-
-    def calculate_local_finish_time(self, core, start_time):
-        """Calculate finish time if task runs on a local device core"""
-        if core < 0 or core >= len(self.local_execution_times):
-            raise ValueError(f"Invalid core ID {core} for task {self.id}")
-        return start_time + self.local_execution_times[core]
-
-    def calculate_cloud_finish_times(self, upload_start_time):
-        """Calculate all cloud-related finish times"""
-        # Calculate upload finish time (FT_i^ws)
-        upload_finish = upload_start_time + self.cloud_execution_times[0]
-        # Calculate cloud computation finish time (FT_i^c)
-        cloud_finish = upload_finish + self.cloud_execution_times[1]
-        # Calculate download finish time (FT_i^wr)
-        download_finish = cloud_finish + self.cloud_execution_times[2]
-        return upload_finish, cloud_finish, download_finish
-
-    def calculate_edge_finish_time(self, edge_id, core_id, start_time):
-        """Calculate finish time if task runs on a specific edge core"""
-        # Get execution time for this edge node and core
-        exec_time = self.get_edge_execution_time(edge_id, core_id)
-        if exec_time is None:
-            logger.warning(f"No execution time data for task {self.id} on edge {edge_id}, core {core_id}")
-            return float('inf')
-        return start_time + exec_time
 
     def get_edge_execution_time(self, edge_id, core_id):
         """Get the execution time for a specific edge node and core"""
@@ -294,80 +244,6 @@ class Task:
         logger.error(f"Unknown transfer path from {source_tier} to {target_tier} for task {self.id}")
         return float('inf')  # Effectively prevents this transfer option
 
-    def calculate_ready_time_cloud_upload(self, download_rates):
-        if not self.pred_tasks:
-            return 0  # Entry task, ready at time 0
-
-        max_ready_time = 0
-
-        for pred_task in self.pred_tasks:
-            # Ensure predecessor has been scheduled
-            if pred_task.is_scheduled == SchedulingState.UNSCHEDULED:
-                logger.warning(f"Predecessor task {pred_task.id} of task {self.id} not yet scheduled")
-                return float('inf')  # Not ready until predecessor is scheduled
-
-            if pred_task.execution_tier == ExecutionTier.DEVICE:
-                # Predecessor executed locally
-                if pred_task.FT_l <= 0:
-                    logger.warning(f"Invalid finish time for predecessor {pred_task.id} on device")
-                    return float('inf')
-                ready_time = pred_task.FT_l
-            elif pred_task.execution_tier == ExecutionTier.CLOUD:
-                # Predecessor uploaded to cloud already
-                if pred_task.FT_ws <= 0:
-                    logger.warning(f"Invalid sending finish time for predecessor {pred_task.id} to cloud")
-                    return float('inf')
-                ready_time = pred_task.FT_ws
-            elif pred_task.execution_tier == ExecutionTier.EDGE:
-                # Predecessor executed on edge
-                if not pred_task.edge_assignment:
-                    logger.warning(f"Edge assignment missing for predecessor {pred_task.id}")
-                    return float('inf')
-
-                pred_edge_id = pred_task.edge_assignment.edge_id
-                # Check if data was sent to cloud directly from edge
-                cloud_key = ('edge', 'cloud')
-                if cloud_key in pred_task.FT_edge_send:
-                    # Data already sent to cloud
-                    ready_time = pred_task.FT_edge_send[cloud_key]
-                else:
-                    # Need to wait for edge execution and then add transfer time
-                    if pred_edge_id not in pred_task.FT_edge:
-                        logger.warning(f"Missing finish time for predecessor {pred_task.id} on edge {pred_edge_id}")
-                        return float('inf')
-
-                    edge_finish_time = pred_task.FT_edge[pred_edge_id]
-                    # Calculate time to transfer from edge to device first
-                    transfer_to_device = pred_task.calculate_data_transfer_time(
-                        ExecutionTier.EDGE, ExecutionTier.DEVICE,
-                        upload_rates_dict={},  # Not needed for this direction
-                        download_rates_dict=download_rates,
-                        source_location=(pred_edge_id, 0)
-                    )
-                    ready_time = edge_finish_time + transfer_to_device
-            else:
-                logger.error(f"Unknown execution tier for predecessor {pred_task.id}")
-                return float('inf')
-
-            max_ready_time = max(max_ready_time, ready_time)
-
-        return max_ready_time
-
-    def get_overall_finish_time(self):
-        finish_times = []
-        if self.FT_l > 0:
-            finish_times.append(self.FT_l)
-        # Add cloud finish time if applicable (when results received)
-        if self.FT_wr > 0:
-            finish_times.append(self.FT_wr)
-        # Add edge finish times if applicable
-        for edge_id, finish_time in self.FT_edge_receive.items():
-            if finish_time > 0:
-                finish_times.append(finish_time)
-        if not finish_times:
-            return -1  # Not scheduled yet
-        return max(finish_times)
-
 @dataclass
 class OptimizationMetrics:
     initial_time: float = 0.0
@@ -462,17 +338,8 @@ class SequenceManager:
         self.num_device_cores = num_device_cores
         self.num_edge_nodes = num_edge_nodes
         self.num_edge_cores_per_node = num_edge_cores_per_node
-
-        # Calculate total number of execution units
-        self.total_units = (
-                num_device_cores +  # Device cores
-                num_edge_nodes * num_edge_cores_per_node +  # Edge cores
-                1  # Cloud platform
-        )
-
-        # Initialize sequences for all execution units
+        self.total_units = num_device_cores + num_edge_nodes * num_edge_cores_per_node + 1
         self.sequences = [[] for _ in range(self.total_units)]
-        # Map to quickly find sequence index for a specific execution unit
         self.unit_to_index_map = {}
 
         # Populate the map for device cores
@@ -487,9 +354,14 @@ class SequenceManager:
                 unit = ExecutionUnit(ExecutionTier.EDGE, (node_id, core_id))
                 index = offset + node_id * num_edge_cores_per_node + core_id
                 self.unit_to_index_map[unit] = index
-        # Add cloud
+
+        # Add the cloud
         cloud_index = self.total_units - 1
         self.unit_to_index_map[ExecutionUnit(ExecutionTier.CLOUD)] = cloud_index
+
+    def get_cloud_index(self):
+        """Return the index in self.sequences corresponding to the cloud resource."""
+        return self.total_units - 1
 
     def set_all_sequences(self, sequences: List[List[int]]) -> None:
         if len(sequences) != self.total_units:
@@ -3188,6 +3060,3 @@ if __name__ == "__main__":
         optimized_schedule_str = format_schedule_3tier(optimized_tasks, scheduler)
         print("\nFormatted optimized schedule:")
         print(optimized_schedule_str)
-
-        # Optional: Visualize the optimized schedule
-        # plot_three_tier_gantt(optimized_tasks, scheduler, title="Optimized Three-Tier Schedule")
